@@ -487,6 +487,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_template_type: str = "hf",
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
+        sc_top_k: int = 0,
     ):
         super().__init__(client)
         self.engine = engine
@@ -498,6 +499,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         self.chat_template_type = chat_template_type
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
+        self.sc_top_k = sc_top_k
 
     def _build_chat_completion(
         self,
@@ -799,6 +801,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
+            sc_top_k=self.sc_top_k,
             stop_token_ids=list(
                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
             ),
@@ -1002,6 +1005,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         chat_template_type: str = "hf",
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
+        sc_top_k: int = 0,
     ):
         super().__init__(client)
         self.engine = engine
@@ -1013,6 +1017,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         self.chat_template_type = chat_template_type
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.lora_name = lora_name
+        self.sc_top_k = sc_top_k
 
     async def create(
         self,
@@ -1176,6 +1181,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
             greedy=temp == 0,
             frequency_penalty=frequency_penalty,
             lora_name=self.lora_name,
+            sc_top_k=self.sc_top_k,
             stop_token_ids=list(
                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
             ),
@@ -1321,6 +1327,7 @@ class ArealOpenAI(AsyncOpenAI):
         chat_template_type: str = "hf",
         chat_template_kwargs: Mapping[str, Any] | None = None,
         lora_name: str = "",
+        sc_top_k: int = 0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1329,6 +1336,7 @@ class ArealOpenAI(AsyncOpenAI):
         self.tool_call_parser = tool_call_parser
         self.reasoning_parser = reasoning_parser
         self.lora_name = lora_name
+        self.sc_top_k = sc_top_k
 
         # Use an ordered dict to maintain insertion order of completions/responses
         self._cache: InteractionCache = InteractionCache()
@@ -1345,6 +1353,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_type=chat_template_type,
             chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
+            sc_top_k=self.sc_top_k,
         )
 
         # Override chat.completions with our extended implementation
@@ -1359,6 +1368,7 @@ class ArealOpenAI(AsyncOpenAI):
             chat_template_type=chat_template_type,
             chat_template_kwargs=chat_template_kwargs,
             lora_name=lora_name,
+            sc_top_k=self.sc_top_k,
         )
 
     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:
