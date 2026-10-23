@@ -1,0 +1,59 @@
+From 05212ef5fc27ee9ad4e09b25f79a4c86fa101922 Mon Sep 17 00:00:00 2001
+From: lvdi <l00993886@china.huawei.com>
+Date: Thu, 22 Oct 2026 12:57:33 +0800
+Subject: [PATCH] fix(engine): use None attention_mask for packed sequences to
+ enable block-diagonal causal mask
+
+The non-Qwen3 path in _prepare_mb_list set attention_mask to
+dict(full_attention=None, sliding_attention=None).  Qwen2Model.forward
+checks isinstance(attention_mask, dict) and, when True, skips
+create_causal_mask entirely -- so eager_attention_forward receives None
+and applies no mask at all.  In a packed sequence this means every token
+attends to every other token across sequence boundaries, making the
+training forward compute global attention instead of causal attention.
+
+This was the root cause of the TIM (Training-Inference Mismatch):
+  - Jaccard (trainer top-k vs vLLM top-k): 0.093 (almost no overlap)
+  - TIM |delta_logp|: 6.72 nats (94% spike rate)
+  - Trainer argmax concentrated 77% on a single token
+
+A/B/C/D control experiments confirmed:
+  - dict(None) bug:        Jaccard=0.126, TIM=4.71, spike=77%
+  - attn=None (this fix): Jaccard=0.605, TIM=0.68, spike=9.8%
+  attn=None lets transformers auto-detect the packed format from
+  position_ids (which reset to 0 at each sequence boundary via
+  amend_position_ids + pack_tensor_dict) and build a correct
+  block-diagonal causal mask via find_packed_sequence_indices.
+
+After this fix TIM drops from ~6.7 to ~0.68 (the bf16 numerical noise
+floor, consistent with B2 tri-ref HF-vs-vLLM |delta|=0.49).
+
+diff --git a/areal/engine/fsdp_engine.py b/areal/engine/fsdp_engine.py
+index 441aedd..05faeb1 100644
+--- a/areal/engine/fsdp_engine.py
++++ b/areal/engine/fsdp_engine.py
+@@ -1957,10 +1957,17 @@ class FSDPEngine(TrainEngine):
+                 mb["attention_mask"] = None
+                 padded_mb["attention_mask"] = None
+             else:
+-                mb["attention_mask"] = dict(full_attention=None, sliding_attention=None)
+-                padded_mb["attention_mask"] = dict(
+-                    full_attention=None, sliding_attention=None
+-                )
++                # Pass None so that the HF model's create_causal_mask auto-detects
++                # packed sequences from position_ids (which reset to 0 at each sequence
++                # boundary via amend_position_ids) and builds a correct block-diagonal
++                # causal mask.  Using dict(full_attention=None, ...) here bypasses the
++                # mask creation path in Qwen2Model.forward (isinstance check on dict),
++                # which causes eager_attention_forward to receive None and skip the mask
++                # entirely -- making every token attend to every other token across
++                # sequence boundaries.  This was the root cause of the TIM
++                # (Training-Inference Mismatch) that broke Score Centering's tail model.
++                mb["attention_mask"] = None
++                padded_mb["attention_mask"] = None
+             _prepare_multimodal_forward_inputs(mb, padded_mb)
+         _drop_multimodal_payloads(mb_list.data)
+         return mb_list
+-- 
+2.50.1.windows.1
+
