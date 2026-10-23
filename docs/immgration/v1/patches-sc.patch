@@ -1,0 +1,1253 @@
+From f8e0b2875c2a6b0bd2edf7f3eb3cbf882b801724 Mon Sep 17 00:00:00 2001
+From: lvdi <l00993886@china.huawei.com>
+Date: Wed, 21 Oct 2026 14:41:06 +0800
+Subject: [PATCH] feat(trainer): add Score Centering drift correction for
+ off-policy RL
+
+Implement additive Score Centering (SC) correction from
+arXiv:2609.20807. When enabled via use_score_centering=True,
+the actor loss switches from PPO clipped surrogate to
+REINFORCE+SC (pure policy gradient + additive drift correction).
+
+Key changes:
+- Add score_centering.py: chunked top-k logprob gather and
+  correction computation with memory-bounded fp32 workspace
+- Add SC config fields to PPOActorConfig with fail-fast
+  validation (sc_mode, sc_clip_*, sc_reinforce_baseline)
+- Add SC loss path in grpo_loss_fn (REINFORCE+SC and pure
+  REINFORCE baseline for fair A/B comparison)
+- Propagate sampler top-k logprobs end-to-end: vLLM ->
+  io_struct -> remote_inf_engine -> rlvr/types -> actor
+- Handle -inf padding for logprob tensors in data pipeline
+- Inject trainer logits into loss_fn input for SC when enabled
+
+diff --git a/areal/api/cli_args.py b/areal/api/cli_args.py
+index 6233240..57579f5 100644
+--- a/areal/api/cli_args.py
++++ b/areal/api/cli_args.py
+@@ -195,6 +195,13 @@ class GenerationHyperparameters:
+         default=1.0,
+         metadata={"help": "Sampling temperature. Higher values increase diversity."},
+     )
++    # Score Centering: number of top-k logprobs to request from sampler
++    sc_top_k: int = field(
++        default=0,
++        metadata={
++            "help": "Number of top-k logprobs to request for Score Centering. 0 = disabled."
++        },
++    )
+     stop_token_ids: list[int] = field(
+         default_factory=list,
+         metadata={"help": "Stop generation when encountering these token IDs."},
+@@ -1674,6 +1681,47 @@ class PPOActorConfig(TrainEngineConfig):
+         },
+     )
+ 
++    # Score Centering (arXiv:2609.20807) — additive drift correction
++    use_score_centering: bool = field(
++        default=False,
++        metadata={
++            "help": "Enable Score Centering (SC) additive drift correction. "
++            "When True, requires sampler top-k logprobs in input_data."
++        },
++    )
++    sc_top_k: int = field(
++        default=128,
++        metadata={
++            "help": "Top-k for Score Centering (number of sampler tokens to capture)."
++        },
++    )
++    sc_mode: str = field(
++        default="none",
++        metadata={
++            "help": "SC + IS combination mode: 'none' (pure SC), 'tis' (truncated IS), 'mis' (mixture IS; not yet implemented, raises at runtime).",
++            "choices": ["none", "tis", "mis"],
++        },
++    )
++    sc_clip_low: float = field(
++        default=0.0,
++        metadata={"help": "Lower bound for SC IS ratio clipping."},
++    )
++    sc_clip_high: float = field(
++        default=float("inf"),
++        metadata={"help": "Upper bound for SC IS ratio clipping."},
++    )
++    sc_reinforce_baseline: bool = field(
++        default=False,
++        metadata={
++            "help": "When True, use pure REINFORCE (-A·log p(a)) as the "
++            "baseline loss for SC-off comparisons, instead of PPO clipped "
++            "surrogate. This enables a fair A1 ablation: SC-on and SC-off "
++            "both use REINFORCE (no PPO ratio), so the only difference is "
++            "the SC correction term. Only takes effect when "
++            "use_score_centering=False (SC-off)."
++        },
++    )
++
+     # Logging Agent Trajectories
+     log_agent_stats: bool = field(
+         default=False,
+@@ -1740,6 +1788,80 @@ class PPOActorConfig(TrainEngineConfig):
+                     "Please set `actor.use_decoupled_loss=false` in your configuration."
+                 )
+ 
++        # Validate Score Centering configuration
++        if self.sc_mode not in ("none", "tis", "mis"):
++            raise ValueError(
++                f"sc_mode must be 'none', 'tis', or 'mis'; got {self.sc_mode!r}."
++            )
++        if self.sc_clip_low >= self.sc_clip_high:
++            raise ValueError(
++                "sc_clip_low must be strictly less than sc_clip_high; "
++                f"got {self.sc_clip_low} >= {self.sc_clip_high}."
++            )
++        # tis mode requires finite sc_clip_high (otherwise weight_fn=identity,
++        # correction degenerates to 0 and pad slots produce 0*inf=NaN).
++        if self.use_score_centering and self.sc_mode == "tis":
++            import math
++
++            if not math.isfinite(self.sc_clip_high):
++                raise ValueError(
++                    "sc_mode='tis' requires finite sc_clip_high "
++                    f"(got {self.sc_clip_high}); use 'none' for pure SC."
++                )
++        # mis mode requires finite sc_clip_low and sc_clip_high, and low >= 0.
++        if self.use_score_centering and self.sc_mode == "mis":
++            import math
++
++            if not (
++                math.isfinite(self.sc_clip_low) and math.isfinite(self.sc_clip_high)
++            ):
++                raise ValueError(
++                    "sc_mode='mis' requires finite sc_clip_low and sc_clip_high "
++                    f"(got low={self.sc_clip_low}, high={self.sc_clip_high})."
++                )
++            if self.sc_clip_low < 0:
++                raise ValueError(
++                    f"sc_mode='mis' requires sc_clip_low >= 0 (got {self.sc_clip_low})."
++                )
++            if self.sc_clip_high <= 0:
++                raise ValueError(
++                    f"sc_mode='mis' requires sc_clip_high > 0 (got {self.sc_clip_high})."
++                )
++
++        # SC + unsupported combinations fail fast.
++        if self.use_score_centering:
++            if self.enable_tree_training:
++                raise NotImplementedError(
++                    "Score Centering is not supported with tree training "
++                    "(enable_tree_training=True). Tree training uses flex attention "
++                    "with a different sequence layout that breaks top-k alignment."
++                )
++            # sc_reinforce_baseline is only meaningful when SC is off (it
++            # switches the SC-off baseline from PPO to REINFORCE). When SC is
++            # on, the loss is always REINFORCE+SC and sc_reinforce_baseline is
++            # silently ignored — fail fast to avoid confusion.
++            if self.sc_reinforce_baseline:
++                raise ValueError(
++                    "sc_reinforce_baseline=True is only valid when "
++                    "use_score_centering=False. When SC is on, the loss is already "
++                    "REINFORCE+SC (no PPO ratio), so the baseline flag is meaningless. "
++                    "Set sc_reinforce_baseline=False or use_score_centering=False."
++                )
++            # recompute_logprob=True means the engine computes old_logp from
++            # the trainer's own forward pass, so TIM (train-inference mismatch)
++            # is effectively 0 — the drift SC is designed to correct does not
++            # exist.  Since the SC correction is advantage-weighted, the
++            # spurious gradient is advantage-gated (≈0 for GRPO), so we warn
++            # rather than hard-reject to avoid blocking on-policy SC experiments.
++            if self.recompute_logprob:
++                logger.warning(
++                    "use_score_centering=True with recompute_logprob=True: "
++                    "TIM is 0 (old_logp from trainer forward), so SC correction "
++                    "targets a non-existent drift. The gradient is "
++                    "advantage-gated, but consider recompute_logprob=False for "
++                    "meaningful drift correction."
++                )
++
+         super().__post_init__()
+ 
+ 
+@@ -1799,6 +1921,9 @@ class vLLMConfig:
+     # original
+     max_num_batched_tokens: int = 2048
+     max_num_seqs: int = 256
++    # Score Centering: vLLM caps logprobs at max_logprobs (default 20).
++    # Auto-raised from gconfig.sc_top_k in PPOConfig.__post_init__.
++    max_logprobs: int = 20
+     # kv_cache_type: str = "auto"
+     block_size: int = 16
+     cpu_offload_gb: float = 0
+@@ -2419,6 +2544,14 @@ class InferenceEngineConfig:
+             "PPOConfig.__post_init__ so load and request sides stay in sync."
+         },
+     )
++    sc_top_k: int = field(
++        default=0,
++        metadata={
++            "help": "Score Centering: number of top-k logprobs to request from "
++            "the vLLM sampler. Auto-filled from gconfig.sc_top_k by "
++            "PPOConfig.__post_init__. 0 = disabled (no top-k logprobs)."
++        },
++    )
+     agent: AgentConfig = field(
+         default_factory=lambda: AgentConfig(
+             agent_cls_path="areal.experimental.openai.proxy.online_agent._OnlineAgent"
+@@ -3412,6 +3545,61 @@ class PPOConfig(BaseExperimentConfig):
+         # the engine config. Single source of truth: gconfig.lora_name.
+         if self.rollout.use_lora and not self.rollout.lora_name:
+             self.rollout.lora_name = self.gconfig.lora_name
++        # Score Centering: actor.sc_top_k is a convenience fallback for the
++        # request side's single source of truth, gconfig.sc_top_k.
++        if self.actor.use_score_centering and self.gconfig.sc_top_k <= 0:
++            if self.actor.sc_top_k > 0:
++                self.gconfig.sc_top_k = self.actor.sc_top_k
++            else:
++                logger.warning(
++                    "actor.use_score_centering=True but both actor.sc_top_k and "
++                    "generation.sc_top_k are 0; no sampler top-k logprobs will be "
++                    "requested and Score Centering will be skipped."
++                )
++        # Propagate sc_top_k to the rollout engine so the OpenAI-proxy generation
++        # path requests the same top-k logprobs the trainer expects for SC.
++        # The request side (ArealOpenAI) cannot read gconfig.sc_top_k, so it must
++        # come from the engine config. Single source of truth: gconfig.sc_top_k.
++        if self.gconfig.sc_top_k > 0 and not self.rollout.sc_top_k:
++            self.rollout.sc_top_k = self.gconfig.sc_top_k
++        # Propagate sc_top_k to vLLM's max_logprobs so the engine accepts
++        # logprobs=sc_top_k (vLLM default cap is 20). Only raises, never lowers.
++        if self.gconfig.sc_top_k > 0:
++            vllm_cfg = getattr(self, "vllm", None)
++            if vllm_cfg is not None and vllm_cfg.max_logprobs < self.gconfig.sc_top_k:
++                vllm_cfg.max_logprobs = self.gconfig.sc_top_k
++
++        # Score Centering sampling prerequisites — SC requires stochastic
++        # sampling so the sampler top-k head is a meaningful distribution.
++        if self.actor.use_score_centering:
++            if self.gconfig.greedy:
++                raise ValueError(
++                    "use_score_centering=True requires stochastic sampling; "
++                    "set generation.greedy=False."
++                )
++            if self.gconfig.temperature <= 0:
++                raise ValueError(
++                    "use_score_centering=True requires temperature > 0; "
++                    f"got {self.gconfig.temperature}."
++                )
++            if not (0 < self.gconfig.top_p <= 1.0):
++                raise ValueError(
++                    "use_score_centering=True requires 0 < top_p <= 1.0; "
++                    f"got {self.gconfig.top_p}."
++                )
++            # top_k: vLLM semantics — <=0 or >= vocab means unbounded.
++            # If bounded, it must be >= sc_top_k so the top-k head is complete.
++            if 0 < self.gconfig.top_k < self.gconfig.sc_top_k:
++                raise ValueError(
++                    f"use_score_centering=True requires top_k >= sc_top_k "
++                    f"({self.gconfig.sc_top_k}) when top_k is bounded; "
++                    f"got top_k={self.gconfig.top_k}. Set top_k<=0 for unbounded."
++                )
++            if self.gconfig.frequency_penalty != 0.0:
++                raise ValueError(
++                    "use_score_centering=True requires no frequency_penalty; "
++                    "set frequency_penalty=0.0."
++                )
+         super().__post_init__()
+ 
+ 
+diff --git a/areal/api/io_struct.py b/areal/api/io_struct.py
+index f5d541c..5702565 100644
+--- a/areal/api/io_struct.py
++++ b/areal/api/io_struct.py
+@@ -82,6 +82,10 @@ class ModelResponse:
+     # MoE routing (only populated when return_routed_experts=True)
+     routed_experts: np.ndarray | None = None
+ 
++    # Score Centering: per-token top-k from sampler
++    output_topk_ids: list[list[int]] | None = None  # [n_output_tokens, k]
++    output_topk_logps: list[list[float]] | None = None  # [n_output_tokens, k]
++
+     @property
+     def input_len(self) -> int:
+         return len(self.input_tokens)
+@@ -392,6 +396,9 @@ class HttpGenerationResult:
+     output_logprobs: list[float]
+     stop_reason: str
+     routed_experts: np.ndarray | None = None
++    # Score Centering: per-token top-k token IDs and log-probs from sampler
++    output_topk_ids: list[list[int]] | None = None  # [n_output_tokens, k]
++    output_topk_logps: list[list[float]] | None = None  # [n_output_tokens, k]
+ 
+ 
+ @dataclass
+diff --git a/areal/engine/fsdp_engine.py b/areal/engine/fsdp_engine.py
+index a920c8b..441aedd 100644
+--- a/areal/engine/fsdp_engine.py
++++ b/areal/engine/fsdp_engine.py
+@@ -132,6 +132,7 @@ from areal.utils.network import find_free_ports, format_host_for_url, gethostip
+ from areal.utils.offload import is_tms_enabled, torch_memory_saver
+ from areal.utils.perf_tracer import trace_perf, trace_scope
+ from areal.utils.save_load import get_state_dict_from_repo_id_or_path
++from areal.utils.score_centering import check_score_centering_sp_supported
+ 
+ if TYPE_CHECKING:
+     from areal.api import Scheduler
+@@ -2180,6 +2181,16 @@ class FSDPEngine(TrainEngine):
+                     entropy = entropy[: -ctx.pad_length]
+                     vocab_min_logits = vocab_min_logits[: -ctx.pad_length]
+                     vocab_max_logits = vocab_max_logits[: -ctx.pad_length]
++                    logits = logits[: -ctx.pad_length]
++            # Score Centering: inject raw trainer logits into input_data so
++            # grpo_loss_fn can call gather_train_head_logp. Conditional on SC
++            # being enabled (read from the loss_fn partial) to avoid carrying
++            # full-vocab logits when SC is off.
++            if getattr(loss_fn, "keywords", {}).get("use_score_centering", False):
++                # Fail fast: the injected logits below are the local SP slice,
++                # while loss_mask/sampler data are all-gathered across SP.
++                check_score_centering_sp_supported(True, self.parallel_helper.sp_size)
++                ctx.mb_input["logits"] = logits
+             loss = loss_fn(
+                 logprobs,
+                 entropy,
+diff --git a/areal/engine/vllm_remote.py b/areal/engine/vllm_remote.py
+index d2a7023..19d7ba2 100644
+--- a/areal/engine/vllm_remote.py
++++ b/areal/engine/vllm_remote.py
+@@ -41,6 +41,55 @@ from areal.utils.offload import sanitize_tms_env_vars
+ logger = logging.getLogger("vLLMEngine")
+ 
+ 
++def _token_to_id(token: object) -> int | None:
++    """Best-effort conversion of a top-logprob token key to an int id."""
++    if isinstance(token, int):
++        return token
++    if token is None:
++        return None
++    s = str(token)
++    if ":" in s:
++        s = s.split(":")[-1]
++    try:
++        return int(s)
++    except ValueError:
++        return None
++
++
++def _parse_top_logprobs(top: object) -> tuple[list[int], list[float]]:
++    """Parse one position's top-k logprobs into (token_ids, logprobs).
++
++    Accepts a mapping ``{token: logprob}`` or a list of
++    ``{"token_id"|"token": ..., "logprob": ...}`` entries. Entries whose token
++    cannot be resolved to an int are skipped.
++    """
++    if top is None:
++        return [], []
++    pairs: list[tuple[object, object]] = []
++    if isinstance(top, dict):
++        pairs = list(top.items())
++    else:
++        for item in top:
++            if not isinstance(item, dict):
++                continue
++            tok = item.get("token_id", item.get("token"))
++            lp = item.get("logprob")
++            if lp is not None:
++                pairs.append((tok, lp))
++    ids: list[int] = []
++    logps: list[float] = []
++    # vLLM already returns top_logprobs sorted by logprob descending; the
++    # downstream SC correction (sum over k) is order-invariant, so we skip
++    # the redundant O(k log k) sort that dominated per-position parsing cost.
++    for tok, lp in pairs:
++        tid = _token_to_id(tok)
++        if tid is None:
++            continue
++        ids.append(tid)
++        logps.append(float(lp))
++    return ids, logps
++
++
+ class VLLMBackend:
+     """vLLM-specific backend implementation for remote inference."""
+ 
+@@ -74,7 +123,9 @@ class VLLMBackend:
+             "skip_special_tokens": gconfig.skip_special_tokens,
+             "frequency_penalty": gconfig.frequency_penalty,
+             "return_tokens_as_token_ids": True,
+-            "logprobs": 0,
++            # Score Centering: >0 requests that many top alternatives
++            # per position; 0 requests only the sampled token logprob.
++            "logprobs": getattr(gconfig, "sc_top_k", 0),
+             "use_beam_search": gconfig.use_beam_search,
+             "stream": False,
+         }
+@@ -138,10 +189,35 @@ class VLLMBackend:
+                 output_logprobs=[],
+                 stop_reason=stop_reason,
+             )
++
++        # Score Centering: parse per-position top-k alternatives, if requested.
++        # vLLM 0.23 stores top_logprobs at meta_info["logprobs"]["top_logprobs"]
++        # as a list (one entry per position) where each entry is a dict
++        # {"token:123": -0.1, ...} or None.
++        output_topk_ids = None
++        output_topk_logps = None
++        top_logprobs = meta_info["logprobs"].get("top_logprobs")
++        if top_logprobs is not None and any(t is not None for t in top_logprobs):
++            output_topk_ids = []
++            output_topk_logps = []
++            for top in top_logprobs:
++                ids, logps = _parse_top_logprobs(top)
++                output_topk_ids.append(ids)
++                output_topk_logps.append(logps)
++            if not any(output_topk_ids):
++                logger.warning(
++                    "Received top_logprobs but parsed no token ids; the vLLM "
++                    "/inference/v1/generate schema may not carry token ids for "
++                    "top alternatives. Score Centering will be skipped for this "
++                    "response."
++                )
++
+         return HttpGenerationResult(
+             output_tokens=output_tokens,
+             output_logprobs=output_logprobs,
+             stop_reason=stop_reason,
++            output_topk_ids=output_topk_ids,
++            output_topk_logps=output_topk_logps,
+         )
+ 
+     def build_score_request(
+diff --git a/areal/experimental/openai/client.py b/areal/experimental/openai/client.py
+index 30b709a..a342471 100644
+--- a/areal/experimental/openai/client.py
++++ b/areal/experimental/openai/client.py
+@@ -487,6 +487,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
+         chat_template_type: str = "hf",
+         chat_template_kwargs: Mapping[str, Any] | None = None,
+         lora_name: str = "",
++        sc_top_k: int = 0,
+     ):
+         super().__init__(client)
+         self.engine = engine
+@@ -498,6 +499,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
+         self.chat_template_type = chat_template_type
+         self.chat_template_kwargs = dict(chat_template_kwargs or {})
+         self.lora_name = lora_name
++        self.sc_top_k = sc_top_k
+ 
+     def _build_chat_completion(
+         self,
+@@ -799,6 +801,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
+             greedy=temp == 0,
+             frequency_penalty=frequency_penalty,
+             lora_name=self.lora_name,
++            sc_top_k=self.sc_top_k,
+             stop_token_ids=list(
+                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
+             ),
+@@ -1002,6 +1005,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
+         chat_template_type: str = "hf",
+         chat_template_kwargs: Mapping[str, Any] | None = None,
+         lora_name: str = "",
++        sc_top_k: int = 0,
+     ):
+         super().__init__(client)
+         self.engine = engine
+@@ -1013,6 +1017,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
+         self.chat_template_type = chat_template_type
+         self.chat_template_kwargs = dict(chat_template_kwargs or {})
+         self.lora_name = lora_name
++        self.sc_top_k = sc_top_k
+ 
+     async def create(
+         self,
+@@ -1176,6 +1181,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
+             greedy=temp == 0,
+             frequency_penalty=frequency_penalty,
+             lora_name=self.lora_name,
++            sc_top_k=self.sc_top_k,
+             stop_token_ids=list(
+                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
+             ),
+@@ -1321,6 +1327,7 @@ class ArealOpenAI(AsyncOpenAI):
+         chat_template_type: str = "hf",
+         chat_template_kwargs: Mapping[str, Any] | None = None,
+         lora_name: str = "",
++        sc_top_k: int = 0,
+         **kwargs,
+     ):
+         super().__init__(**kwargs)
+@@ -1329,6 +1336,7 @@ class ArealOpenAI(AsyncOpenAI):
+         self.tool_call_parser = tool_call_parser
+         self.reasoning_parser = reasoning_parser
+         self.lora_name = lora_name
++        self.sc_top_k = sc_top_k
+ 
+         # Use an ordered dict to maintain insertion order of completions/responses
+         self._cache: InteractionCache = InteractionCache()
+@@ -1345,6 +1353,7 @@ class ArealOpenAI(AsyncOpenAI):
+             chat_template_type=chat_template_type,
+             chat_template_kwargs=chat_template_kwargs,
+             lora_name=lora_name,
++            sc_top_k=self.sc_top_k,
+         )
+ 
+         # Override chat.completions with our extended implementation
+@@ -1359,6 +1368,7 @@ class ArealOpenAI(AsyncOpenAI):
+             chat_template_type=chat_template_type,
+             chat_template_kwargs=chat_template_kwargs,
+             lora_name=lora_name,
++            sc_top_k=self.sc_top_k,
+         )
+ 
+     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:
+diff --git a/areal/experimental/openai/proxy/proxy_rollout_server.py b/areal/experimental/openai/proxy/proxy_rollout_server.py
+index e89f684..e828125 100644
+--- a/areal/experimental/openai/proxy/proxy_rollout_server.py
++++ b/areal/experimental/openai/proxy/proxy_rollout_server.py
+@@ -296,6 +296,7 @@ def _setup_openai_client():
+         tool_call_parser=agent_cfg.tool_call_parser,
+         reasoning_parser=agent_cfg.reasoning_parser,
+         engine_max_tokens=agent_cfg.engine_max_tokens,
++        sc_top_k=getattr(config, "sc_top_k", 0),
+         chat_template_type=agent_cfg.chat_template_type,
+         chat_template_kwargs=chat_template_kwargs,
+         lora_name=config.lora_name,
+diff --git a/areal/experimental/openai/types.py b/areal/experimental/openai/types.py
+index 3070925..c6a3baf 100644
+--- a/areal/experimental/openai/types.py
++++ b/areal/experimental/openai/types.py
+@@ -12,6 +12,7 @@ from openai.types.responses.response_input_param import ResponseInputParam
+ 
+ from areal.api import ModelResponse
+ from areal.utils import logging
++from areal.utils.score_centering import pad_topk_ids, pad_topk_logps
+ 
+ logger = logging.getLogger("TokenLogpReward")
+ 
+@@ -203,6 +204,43 @@ class InteractionWithTokenLogpReward:
+             # reward
+             rewards=torch.tensor([float(reward)]),
+         )
++        # Score Centering: propagate sampler top-k logprobs if available.
++        # Mirrors rlvr.py SC logic: input positions get zero top-k (no sampler
++        # data), output positions get the actual top-k token ids and logprobs.
++        if resp.output_topk_ids is not None and resp.output_topk_logps is not None:
++            if self.chat_template_type == "concat" and self.parent is not None:
++                raise NotImplementedError(
++                    "Score Centering is not supported with chat_template_type="
++                    "'concat' multi-turn interactions: the parent's top-k sampler "
++                    "data is not propagated into the child trajectory. Use "
++                    "chat_template_type='hf' or disable Score Centering."
++                )
++            pad_k = (
++                max(len(k) for k in resp.output_topk_ids) if resp.output_topk_ids else 0
++            )
++            if pad_k > 0:
++                k_dim = pad_k
++                # Input tokens have no sampler data. Pad ids with 0 and
++                # log-probs with -inf so they contribute zero mass.
++                input_topk_ids = [
++                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
++                ]
++                input_topk_logps = [
++                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
++                ]
++                # Output tokens: pad each row to k_dim.
++                output_topk_ids = [
++                    pad_topk_ids(ids, k_dim) for ids in resp.output_topk_ids
++                ]
++                output_topk_logps = [
++                    pad_topk_logps(logps, k_dim) for logps in resp.output_topk_logps
++                ]
++                result["sampler_topk_token_ids"] = torch.tensor(
++                    input_topk_ids + output_topk_ids, dtype=torch.int32
++                ).unsqueeze(0)  # [1, seq_len, k]
++                result["sampler_topk_logps"] = torch.tensor(
++                    input_topk_logps + output_topk_logps, dtype=torch.float32
++                ).unsqueeze(0)  # [1, seq_len, k]
+         self._cache = result
+         return result
+ 
+diff --git a/areal/infra/remote_inf_engine.py b/areal/infra/remote_inf_engine.py
+index 6b5453f..fc4ece0 100644
+--- a/areal/infra/remote_inf_engine.py
++++ b/areal/infra/remote_inf_engine.py
+@@ -950,6 +950,8 @@ class RemoteInfEngine(InferenceEngine):
+         accumulated_output_logprobs = []
+         accumulated_versions = []
+         accumulated_routed_experts: list[np.ndarray] = []
++        accumulated_topk_ids = []
++        accumulated_topk_logps = []
+ 
+         # A single "rid" shares the same server to allow KV cache reuse
+         if req.rid in self.rid_to_address:
+@@ -1032,6 +1034,24 @@ class RemoteInfEngine(InferenceEngine):
+             # Accumulate routed_experts for MoE models
+             if gen_result.routed_experts is not None:
+                 accumulated_routed_experts.append(gen_result.routed_experts)
++            # Accumulate SC top-k fields
++            if gen_result.output_topk_ids is not None:
++                # Assert per-chunk length to catch truncation early.
++                assert len(gen_result.output_topk_ids) == len(
++                    gen_result.output_tokens
++                ), (
++                    f"output_topk_ids len {len(gen_result.output_topk_ids)} "
++                    f"!= output_tokens len {len(gen_result.output_tokens)}"
++                )
++                accumulated_topk_ids.extend(gen_result.output_topk_ids)
++            if gen_result.output_topk_logps is not None:
++                assert len(gen_result.output_topk_logps) == len(
++                    gen_result.output_tokens
++                ), (
++                    f"output_topk_logps len {len(gen_result.output_topk_logps)} "
++                    f"!= output_tokens len {len(gen_result.output_tokens)}"
++                )
++                accumulated_topk_logps.extend(gen_result.output_topk_logps)
+ 
+             # Update request for next iteration
+             req.input_ids += gen_result.output_tokens
+@@ -1071,6 +1091,10 @@ class RemoteInfEngine(InferenceEngine):
+             tokenizer=req.tokenizer,
+             processor=req.processor,
+             routed_experts=accumulated_routed_experts,
++            output_topk_ids=accumulated_topk_ids if accumulated_topk_ids else None,
++            output_topk_logps=accumulated_topk_logps
++            if accumulated_topk_logps
++            else None,
+         )
+         return response
+ 
+diff --git a/areal/trainer/ppo/actor.py b/areal/trainer/ppo/actor.py
+index 7d4a56c..96ced4c 100644
+--- a/areal/trainer/ppo/actor.py
++++ b/areal/trainer/ppo/actor.py
+@@ -36,6 +36,10 @@ from areal.utils.functional import (
+     sapo_loss_fn,
+ )
+ from areal.utils.perf_tracer import trace_perf
++from areal.utils.score_centering import (
++    gather_train_head_logp,
++    score_centering_correction,
++)
+ 
+ logger = logging.getLogger("PPOActor")
+ 
+@@ -186,6 +190,14 @@ class PPOActor:
+             old_logp = data["logprobs"] = prox_logp_value
+         else:
+             old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
++            # When recompute_logprob=false, old_logp comes from vLLM inference.
++            # The data.py -inf padding for "logprobs" correctly zeroes q_mass
++            # (exp(-inf)=0), but -inf flows into prox_logp and triggers the
++            # NaN/Inf safety check in _resolve_proximal_logp. Sanitize to a
++            # large negative finite value; padding positions are masked by
++            # loss_mask in subsequent PPO/SC computations.
++            old_logp = torch.nan_to_num(old_logp, neginf=-1e4, nan=-1e4)
++            data["logprobs"] = old_logp
+             if not self.config.use_decoupled_loss:
+                 # prox logp not available, use inferenced logp
+                 data["prox_logp"] = old_logp
+@@ -246,6 +258,19 @@ class PPOActor:
+         # because we have rolled old_logp by -1
+         data["logprobs"] = old_logp
+ 
++        # Roll sampler top-k data by -1 on the sequence dim to match
++        # source-aligned (shifted) loss_mask / logprobs.  The sampler produces
++        # token-aligned top-k (topk[t] is the distribution that generated x_t),
++        # but trainer logits[t] predicts x_{t+1}, so top-k must be shifted left
++        # by one to align with the source-aligned quantities.
++        for key in (
++            "sampler_topk_logps",
++            "sampler_topk_token_ids",
++            "sampler_topk_mask",
++        ):
++            if key in data and data[key] is not None:
++                data[key] = torch.roll(data[key], shifts=-1, dims=1)
++
+         return data
+ 
+     @trace_perf("ppo_actor.ppo_update", category="compute")
+@@ -359,6 +384,12 @@ class PPOActor:
+                         sapo_tau_pos=self.config.sapo_tau_pos,
+                         sapo_tau_neg=self.config.sapo_tau_neg,
+                         use_decoupled_loss=self.config.use_decoupled_loss,
++                        use_score_centering=self.config.use_score_centering,
++                        sc_mode=self.config.sc_mode,
++                        sc_clip_low=self.config.sc_clip_low,
++                        sc_clip_high=self.config.sc_clip_high,
++                        sc_temperature=self.config.temperature,
++                        sc_reinforce_baseline=self.config.sc_reinforce_baseline,
+                     ),
+                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                 )
+@@ -423,6 +454,12 @@ def grpo_loss_fn(
+     use_decoupled_loss: bool = False,
+     vocab_min_logits: torch.Tensor | None = None,
+     vocab_max_logits: torch.Tensor | None = None,
++    use_score_centering: bool = False,
++    sc_mode: str = "none",
++    sc_clip_low: float = 0.0,
++    sc_clip_high: float = float("inf"),
++    sc_temperature: float = 1.0,
++    sc_reinforce_baseline: bool = False,
+ ):
+     """Loss function for actor step, all inputs should be splitted into
+     pipeline micro batches, returns loss and logging stats."""
+@@ -479,6 +516,108 @@ def grpo_loss_fn(
+             cu_seqlens=input_data.get("cu_seqlens"),
+         )
+ 
++    # === Score Centering (SC) correction ===
++    # Plan A (REINFORCE+SC): when SC is enabled and SC data is available,
++    # replace the PPO loss entirely with a REINFORCE+SC loss:
++    #   ℓ = -A·log p(a) + A·correction
++    # The first term is pure REINFORCE (no PPO ratio, no clipping); the
++    # second term is the SC additive drift correction. This matches the
++    # official SC paper's integration (REINFORCE+SC) rather than appending
++    # SC on top of PPO (Plan B), which produces gradient inconsistency
++    # when ratio≠1 (recompute=false).
++    #
++    # When sc_reinforce_baseline=True and SC is off, use pure REINFORCE
++    # (-A·log p(a)) as the baseline loss instead of PPO, enabling a fair
++    # A1 ablation (both SC-on and SC-off use REINFORCE, the only difference
++    # is the SC correction term).
++    sc_correction = None
++    sc_s_bar = None
++    sc_q_mass = None
++    sc_p_mass = None
++    sc_rho = None
++    sc_loss = None
++    # Track whether the loss was overridden by REINFORCE/REINFORCE+SC (Plan A).
++    # When True, PPO stat fields (clip_mask, importance_weight, etc.) reflect
++    # PPO's computation but the actual loss is REINFORCE+SC — they are logged
++    # for observability but should not be interpreted as the training signal.
++    sc_loss_overridden = False
++    if use_score_centering:
++        sampler_topk_logps = input_data.get("sampler_topk_logps")
++        sampler_topk_token_ids = input_data.get("sampler_topk_token_ids")
++        train_logits = input_data.get("logits")  # [batch, seq, vocab]
++
++        if (
++            sampler_topk_logps is not None
++            and sampler_topk_token_ids is not None
++            and train_logits is not None
++        ):
++            # Gather trainer log-probs for the sampler's top-k tokens, using the
++            # same temperature the trainer applied to its own logprobs.
++            with stats_tracker.record_timing("sc_gather_train_head_logp"):
++                train_head_logp = gather_train_head_logp(
++                    logits=train_logits,
++                    token_ids=sampler_topk_token_ids,
++                    temperature=sc_temperature,
++                )  # [batch, seq, k]
++
++            with stats_tracker.record_timing("sc_correction"):
++                (
++                    sc_correction,
++                    sc_s_bar,
++                    sc_q_mass,
++                    sc_p_mass,
++                    sc_rho,
++                ) = score_centering_correction(
++                    train_head_logp=train_head_logp,
++                    sampler_topk_logps=sampler_topk_logps,
++                    sampler_topk_mask=input_data.get("sampler_topk_mask"),
++                    sc_mode=sc_mode,
++                    sc_clip_low=sc_clip_low,
++                    sc_clip_high=sc_clip_high,
++                )  # each [batch, seq]
++
++            # Plan A: REINFORCE + SC independent path.
++            #   ℓ = -A·log p(a) + A·correction
++            # REINFORCE term: -advantage * logp (pure policy gradient, no ratio).
++            # SC term: advantage * correction (additive drift correction).
++            # Both terms are advantage-weighted so gradient direction is tied
++            # to the reward signal. advantage is already computed and detached.
++            mask_f = loss_mask.to(logprobs.dtype)
++            n_valid = mask_f.sum().clamp(min=1)
++            pg_term = (
++                -advantages.detach() * logprobs
++            )  # -A·log p(a), grad through logprobs
++            sc_term = advantages.detach() * sc_correction  # A·correction
++            combined = torch.where(
++                loss_mask,
++                pg_term + sc_term,
++                torch.zeros_like(pg_term),
++            )
++            loss = combined.sum() / n_valid
++            sc_loss = sc_term.detach()  # for logging
++            sc_loss_overridden = True
++        else:
++            logger.warning(
++                "use_score_centering=True but SC correction skipped: "
++                f"sampler_topk_logps={'present' if sampler_topk_logps is not None else 'MISSING'}, "
++                f"sampler_topk_token_ids={'present' if sampler_topk_token_ids is not None else 'MISSING'}, "
++                f"logits={'present' if train_logits is not None else 'MISSING'}; "
++                f"input_data keys={list(input_data.keys())[:18]}"
++            )
++    elif sc_reinforce_baseline:
++        # A1 baseline: pure REINFORCE (-A·log p(a)), no PPO ratio, no clipping.
++        # Used for fair SC-on vs SC-off comparison under Plan A.
++        mask_f = loss_mask.to(logprobs.dtype)
++        n_valid = mask_f.sum().clamp(min=1)
++        pg_term = -advantages.detach() * logprobs  # -A·log p(a), grad through logprobs
++        combined = torch.where(
++            loss_mask,
++            pg_term,
++            torch.zeros_like(pg_term),
++        )
++        loss = combined.sum() / n_valid
++        sc_loss_overridden = True
++
+     # Joint Distillation KL Loss
+     teacher_logp = input_data.get("teacher_logp")
+     rkl_stat = None
+@@ -576,7 +715,7 @@ def grpo_loss_fn(
+         new_logp=logprobs.detach(),
+         old_logp=old_logp,
+         entropy=entropy.float(),
+-        actor_loss=stat["loss"],
++        actor_loss=stat["loss"] if not sc_loss_overridden else combined.detach(),
+         clip_ratio=stat["clip_mask"].float(),
+         dual_clip_ratio=stat["dual_clip_mask"].float(),
+         denominator="n_valid_tokens",
+@@ -638,6 +777,44 @@ def grpo_loss_fn(
+             version_metrics_mask=version_metrics_mask,
+         )
+ 
++    # Log SC statistics
++    if sc_correction is not None:
++        stats_tracker.stat(
++            sc_correction=sc_correction.detach(),
++            sc_s_bar=sc_s_bar.detach() if sc_s_bar is not None else None,
++            sc_q_mass=sc_q_mass.detach() if sc_q_mass is not None else None,
++            # New observability metrics for detecting pad pollution
++            # and tail-model degeneration.
++            sc_p_mass=sc_p_mass.detach() if sc_p_mass is not None else None,
++            sc_rho=sc_rho.detach() if sc_rho is not None else None,
++            denominator="n_valid_tokens",
++        )
++        # Log the SC loss term (advantage * correction) for Plan A observability.
++        if sc_loss is not None:
++            stats_tracker.stat(
++                sc_loss_term=sc_loss,
++                denominator="n_valid_tokens",
++            )
++        # Derived health metric: |correction / s_bar| ratio — should be
++        # O(1) when the tail model is healthy; ~1.0 signals alpha*p -> 0
++        # (rho degeneration). Guard against div-by-zero.
++        if sc_s_bar is not None:
++            abs_s_bar = sc_s_bar.detach().abs()
++            safe_s_bar = torch.where(
++                abs_s_bar > 1e-8, abs_s_bar, torch.ones_like(abs_s_bar)
++            )
++            sc_correction_ratio = sc_correction.detach().abs() / safe_s_bar
++            # Only report where s_bar is non-trivially non-zero.
++            valid_ratio = abs_s_bar > 1e-8
++            stats_tracker.stat(
++                sc_correction_ratio=torch.where(
++                    valid_ratio,
++                    sc_correction_ratio,
++                    torch.zeros_like(sc_correction_ratio),
++                ),
++                denominator="n_valid_tokens",
++            )
++
+     return loss
+ 
+ 
+diff --git a/areal/utils/data.py b/areal/utils/data.py
+index 6415207..5046ad6 100644
+--- a/areal/utils/data.py
++++ b/areal/utils/data.py
+@@ -288,7 +288,17 @@ def concat_padded_tensors(
+             continue
+         values = [td[key] for td in tensor_dicts]
+         if isinstance(values[0], torch.Tensor):
+-            pv = 0.0 if key == "attention_mask" else pad_value
++            if key == "attention_mask":
++                pv = 0.0
++            elif key in ("sampler_topk_logps", "ref_logprobs", "logprobs"):
++                # Explicit whitelist for logprob keys that need -inf padding.
++                # Previously used substring match ("_logps" in key) which also
++                # matched ref_logprobs correctly but could false-match future keys.
++                # exp(-inf) == 0 so padded slots contribute no probability mass;
++                # exp(0.0) == 1 would silently inflate q_mass (see score_centering).
++                pv = float("-inf")
++            else:
++                pv = pad_value
+             result[key] = _pad_cat_dim0(values, pad_value=pv)
+         elif isinstance(values[0], list):
+             result[key] = [item for v in values for item in v]
+@@ -748,8 +758,18 @@ def split_padded_tensor_dict_into_mb_list(
+     for key, value in data.items():
+         if key in multimodal_keys:
+             continue
+-        if key == "position_ids" or (
+-            torch.is_tensor(value) and value.numel() == bs * max_seqlen
++        if (
++            key == "position_ids"
++            or (torch.is_tensor(value) and value.numel() == bs * max_seqlen)
++            or (
++                # Score Centering: also split 3D tensors [bs, max_seqlen, k] (e.g.
++                # sampler_topk_logps/token_ids) so pack_tensor_dict can pack them
++                # to [total_tokens, k], matching logits/loss_mask seq dimension.
++                torch.is_tensor(value)
++                and value.ndim >= 2
++                and value.shape[0] == bs
++                and value.shape[1] == max_seqlen
++            )
+         ):
+             # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
+             to_split[key] = value
+diff --git a/areal/utils/score_centering.py b/areal/utils/score_centering.py
+new file mode 100644
+index 0000000..7806465
+--- /dev/null
++++ b/areal/utils/score_centering.py
+@@ -0,0 +1,278 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Score Centering (SC) correction for off-policy RL.
++
++Implements the additive drift correction from "Score Centering Stabilizes
++Off-policy Reinforcement Learning" (arXiv:2609.20807, Marek & Ryabinin).
++
++The sampler's top-k head is exact; its tail is modeled as the trainer's tail
++rescaled to the sampler's tail mass, so the centering term only needs the k
++head log-probs of the trainer. This mirrors the reference implementation in
++VeRL (verl/trainer/ppo/score_centering.py) and Slime (PR #2405).
++
++Core idea: subtract the expected trainer score under the sampler distribution:
++    correction = sum_H sg[q*w - alpha*p] * log p   (additive, low variance)
++
++where rho = (1 - q_mass) / (1 - p_mass) models the tail mass ratio, alpha =
++rho * weight_fn(1/rho) is the tail IS weight, and w = weight_fn(p/q) is the
++head IS weight. When weight_fn = identity (pure SC, no IS), the correction
++reduces to the exact top-k centering term. On-policy (p=q) -> correction = 0
++(residual = 0). Gradient flows only through the trainer logits; all sampler
++quantities and the residual are detached.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++
++import torch
++
++# Padding log-prob for an absent top-k slot. ``exp(-inf) == 0`` so padded slots
++# contribute no probability mass; padding with ``0.0`` would mean ``exp(0) == 1``
++# and silently inflate ``q_mass``.
++NEG_INF_PAD = float("-inf")
++
++# Chunk size for _TopKLogProbsFromLogits: bounds the fp32 workspace to
++# (chunk_size, vocab) instead of (N, vocab). Matches VeRL default.
++_TOPK_LOG_PROB_CHUNK_SIZE = 4096
++
++
++def pad_topk_ids(token_ids: list[int], k: int) -> list[int]:
++    """Right-pad a top-k token-id row to length *k* with the padding id 0."""
++    ids = list(token_ids[:k])
++    return ids + [0] * max(0, k - len(ids))
++
++
++def pad_topk_logps(logps: list[float], k: int) -> list[float]:
++    """Right-pad a top-k log-prob row to length *k* with ``-inf`` (q = 0)."""
++    ps = list(logps[:k])
++    return ps + [NEG_INF_PAD] * max(0, k - len(ps))
++
++
++def check_score_centering_sp_supported(use_score_centering: bool, sp_size: int) -> None:
++    """Fail fast when Score Centering is combined with Ulysses sequence parallel.
++
++    ``fsdp_engine`` injects the trainer ``logits`` for the *local* SP slice,
++    while ``logprobs``/``loss_mask`` are all-gathered to the full sequence first.
++    With ``sp_size > 1`` the injected logits therefore have a different sequence
++    length than the sampler data, so SC cannot run correctly.
++    """
++    if use_score_centering and sp_size > 1:
++        raise NotImplementedError(
++            "Score Centering is not supported with Ulysses sequence parallel "
++            f"(sp_size={sp_size}): the injected trainer logits are the local SP "
++            "slice, not the full sequence. Set actor.use_score_centering=False "
++            "or keep sp_size == 1."
++        )
++
++
++class _TopKLogProbsFromLogits(torch.autograd.Function):
++    """log_softmax(logits).gather(ids) with a bounded fp32 workspace.
++
++    Equivalent to ``torch.log_softmax(logits, dim=-1).gather(-1, token_ids)``
++    but never materializes the full (N, V) softmax at once: the normalizer is
++    recomputed per chunk in forward and backward, bounding the extra fp32
++    workspace to (chunk_size, V).
++
++    Only the original logits, the token_ids and two scalars per row (maxima,
++    denominators) are saved for backward; the softmax is recomputed per chunk.
++
++    Ported from VeRL (verl/trainer/ppo/score_centering.py).
++    """
++
++    @staticmethod
++    def forward(ctx, logits, token_ids, chunk_size):
++        n = logits.shape[0]
++        chunk_size = chunk_size if chunk_size > 0 else max(n, 1)
++        # Use the input dtype, but promote low-precision floats (bf16/fp16) to
++        # fp32 for numerical safety. fp64 is preserved for test precision.
++        work_dtype = (
++            logits.dtype
++            if logits.dtype in (torch.float32, torch.float64)
++            else torch.float32
++        )
++        output = torch.empty(token_ids.shape, device=logits.device, dtype=work_dtype)
++        maxima = torch.empty((n, 1), device=logits.device, dtype=work_dtype)
++        denominators = torch.empty_like(maxima)
++        for start in range(0, n, chunk_size):
++            end = min(start + chunk_size, n)
++            work = logits[start:end].to(dtype=work_dtype, copy=True)
++            maximum = work.max(dim=-1, keepdim=True).values
++            targets = work.gather(-1, token_ids[start:end])
++            work.sub_(maximum).exp_()
++            denominator = work.sum(dim=-1, keepdim=True)
++            output[start:end] = (targets - maximum) - denominator.log()
++            maxima[start:end] = maximum
++            denominators[start:end] = denominator
++            del work
++        ctx.save_for_backward(logits, token_ids, maxima, denominators)
++        ctx.chunk_size = chunk_size
++        return output
++
++    @staticmethod
++    @torch.autograd.function.once_differentiable
++    def backward(ctx, grad_output):
++        logits, token_ids, maxima, denominators = ctx.saved_tensors
++        n = logits.shape[0]
++        work_dtype = maxima.dtype  # same as forward's work_dtype
++        grad_input = torch.empty_like(logits)
++        for start in range(0, n, ctx.chunk_size):
++            end = min(start + ctx.chunk_size, n)
++            work = logits[start:end].to(dtype=work_dtype, copy=True)
++            work.sub_(maxima[start:end]).exp_().div_(denominators[start:end])
++            grad = grad_output[start:end].to(dtype=work_dtype)
++            work.mul_(-grad.sum(dim=-1, keepdim=True))
++            work.scatter_add_(-1, token_ids[start:end], grad)
++            grad_input[start:end] = work
++            del work
++        return grad_input, None, None
++
++
++def gather_train_head_logp(
++    logits: torch.Tensor,
++    token_ids: torch.Tensor,
++    temperature: float = 1.0,
++) -> torch.Tensor:
++    """Gather log-probs of *token_ids* from trainer *logits*.
++
++    Uses a chunked fp32 autograd function that never materializes the full
++    (N, V) softmax, bounding memory to (chunk_size, V). Equivalent to
++    ``torch.log_softmax(logits, dim=-1).gather(-1, token_ids)`` but memory-safe.
++
++    Args:
++        logits: ``[..., vocab]`` — raw trainer logits.
++        token_ids: ``[..., k]`` — top-k token IDs sampled by the sampler.
++        temperature: softmax temperature applied to logits.
++
++    Returns:
++        ``[..., k]`` — log-prob of each token under the trainer distribution.
++        Gradient flows through logits only.
++    """
++    if temperature != 1.0:
++        logits = logits / temperature
++    # Reshape to (N, vocab) / (N, k) for the chunked autograd function.
++    orig_shape = logits.shape[:-1]
++    flat_logits = logits.reshape(-1, logits.shape[-1])
++    flat_ids = token_ids.reshape(-1, token_ids.shape[-1]).long()
++    flat_logp = _TopKLogProbsFromLogits.apply(
++        flat_logits, flat_ids, _TOPK_LOG_PROB_CHUNK_SIZE
++    )
++    return flat_logp.reshape(*orig_shape, token_ids.shape[-1])
++
++
++def _build_weight_fn(
++    sc_mode: str, sc_clip_low: float, sc_clip_high: float
++) -> Callable[[torch.Tensor], torch.Tensor]:
++    """Build the IS weight function shared by head and tail (after VeRL).
++
++    - "none": identity (pure SC, no IS) -> weight_fn(r) = 1
++    - "tis": upper-clamp -> weight_fn(r) = r.clamp(max=sc_clip_high)
++    - "mis": band-mask (IcePop) -> weight_fn(r) = where(low<=r<=high, r, 0)
++    """
++    if sc_mode == "none":
++        return torch.ones_like
++    if sc_mode == "tis":
++        return lambda ratio: ratio.clamp(max=sc_clip_high)
++    if sc_mode == "mis":
++        low, high = sc_clip_low, sc_clip_high
++        return lambda ratio: torch.where(
++            (ratio >= low) & (ratio <= high), ratio, torch.zeros_like(ratio)
++        )
++    raise ValueError(f"sc_mode must be 'none', 'tis', or 'mis'; got {sc_mode!r}.")
++
++
++def score_centering_correction(
++    train_head_logp: torch.Tensor,
++    sampler_topk_logps: torch.Tensor,
++    sampler_topk_mask: torch.Tensor | None = None,
++    sc_mode: str = "none",
++    sc_clip_low: float = 0.0,
++    sc_clip_high: float = float("inf"),
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Compute the additive Score Centering correction.
++
++    The sampler's tail (outside the top-k head H) is modeled as the trainer's
++    tail rescaled by ``alpha = rho * weight_fn(1/rho)`` with
++    ``rho = (1 - q_mass) / (1 - p_mass)``, so the correction only needs the k
++    head log-probs of both distributions.
++
++        correction = sum_H sg[q*w - alpha*p] * log p     (additive, low variance)
++
++    On-policy (p=q) -> residual = 0 -> correction = 0 (exact no-op, both value
++    and gradient). Gradient flows only through *train_head_logp*; all sampler
++    quantities and the residual are detached.
++
++    Args:
++        train_head_logp: ``[batch, seq, k]`` — trainer log-probs for the
++            sampler's top-k tokens (from :func:`gather_train_head_logp`).
++            **Gradient flows through this tensor only.**
++        sampler_topk_logps: ``[batch, seq, k]`` — sampler log-probs for the
++            same top-k tokens. **Detached** (no gradient to inference engine).
++        sampler_topk_mask: ``[batch, seq, k]`` — optional mask (1 = valid).
++        sc_mode: "none" (pure SC) | "tis" (truncated IS) | "mis" (mixture IS).
++        sc_clip_low / sc_clip_high: bounds for IS ratio clipping (tis/mis).
++
++    Returns:
++        ``(correction, s_bar, q_mass, p_mass, rho)`` each ``[batch, seq]``.
++
++        - correction: centering term to subtract from the loss (has gradient).
++        - s_bar: ``sum_v q_v * s_p(v)`` (expected trainer score under sampler,
++          detached). Kept for backward-compatible stats reporting.
++        - q_mass: ``sum_v q_v`` (sampler head mass, detached).
++        - p_mass: ``sum_v p_v`` (trainer head mass over the sampler top-k,
++          detached). Used to detect pad-slot pollution of the trainer head.
++        - rho: ``(1 - q_mass) / (1 - p_mass)`` tail-mass ratio (detached).
++          A value of ~0 signals tail-model degeneration.
++    """
++
++    # Promote low-precision floats (bf16/fp16) to fp32 for numerical safety;
++    # keep fp32 and fp64 as-is (fp64 needed for test precision).
++    def _promote(t: torch.Tensor) -> torch.Tensor:
++        return t.float() if t.dtype in (torch.bfloat16, torch.float16) else t
++
++    train_head_logp = _promote(train_head_logp)
++    q_logp = _promote(sampler_topk_logps.detach())  # [batch, seq, k]
++
++    q = torch.exp(q_logp)  # [batch, seq, k]
++
++    # Self-evident mask: -inf logprob slots are invalid (pad). Fall back to
++    # finiteness of the sampler logprob when no explicit mask is provided.
++    if sampler_topk_mask is not None:
++        valid = sampler_topk_mask.detach().bool()
++    else:
++        valid = torch.isfinite(q_logp)
++    mask = valid.float()  # [batch, seq, k]
++
++    # Apply mask: a masked slot must contribute zero mass, not exp(0)=1.
++    q = q * mask
++
++    weight_fn = _build_weight_fn(sc_mode, sc_clip_low, sc_clip_high)
++
++    with torch.no_grad():
++        p = train_head_logp.exp() * mask  # [batch, seq, k] — also masked
++        p_mass = p.sum(-1)  # [batch, seq]
++        q_mass = q.sum(-1)  # [batch, seq]
++
++        # Tail mass ratio: rho = q_tail / p_tail = (1-q_mass) / (1-p_mass).
++        # Clamp tails to eps to avoid div-by-zero when head covers most mass.
++        eps = 1e-6
++        rho = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
++        alpha = rho * weight_fn(1.0 / rho)  # [batch, seq]
++
++        # Head IS weight: w = weight_fn(p/q). In pure SC (weight_fn=ones), w=1.
++        # Use a safe ratio (replace inf/NaN in pad slots with 0 before weight_fn).
++        ratio = torch.where(
++            valid, (train_head_logp - q_logp).exp(), torch.zeros_like(q_logp)
++        )
++        head_weights = weight_fn(ratio) * mask  # [batch, seq, k]
++
++        # Residual: weighted sampler head minus weighted trainer tail estimate.
++        # Pad slots are exactly zero: q=0, head_weights=0, p=0, so residual=0.
++        residual = q * head_weights - alpha.unsqueeze(-1) * p  # [batch, seq, k]
++
++    # Gradient flows only through train_head_logp (residual is detached).
++    correction = (residual * train_head_logp).sum(-1)  # [batch, seq]
++
++    # s_bar kept for backward-compatible stats reporting (detached).
++    s_bar = (q * train_head_logp.detach()).sum(-1)  # [batch, seq]
++
++    return correction, s_bar, q_mass, p_mass, rho
+diff --git a/areal/workflow/rlvr.py b/areal/workflow/rlvr.py
+index 8f6c653..9467292 100644
+--- a/areal/workflow/rlvr.py
++++ b/areal/workflow/rlvr.py
+@@ -23,6 +23,7 @@ from areal.utils.perf_tracer import (
+     session_context,
+     trace_session,
+ )
++from areal.utils.score_centering import pad_topk_ids, pad_topk_logps
+ from areal.workflow.reward_metrics import log_reward_metrics
+ 
+ logger = logging.getLogger("RLVRWorkflow")
+@@ -175,4 +176,50 @@ class RLVRWorkflow(RolloutWorkflow):
+             "attention_mask": torch.ones(len(seq), dtype=torch.bool),
+             "rewards": torch.tensor(reward, dtype=torch.float32),
+         }
+-        return {k: v.unsqueeze(0) for k, v in res.items()}
++
++        # Score Centering: propagate sampler top-k data if available
++        if resp.output_topk_ids is not None and resp.output_topk_logps is not None:
++            raw_max_k = (
++                max(len(k) for k in resp.output_topk_ids) if resp.output_topk_ids else 0
++            )
++            if raw_max_k > 0:
++                # vLLM v1 returns 1 + num_logprobs entries (sampled token +
++                # top-N); when the sampled token is outside top-N the dict keeps
++                # all 1+N entries, so raw_max_k may be sc_top_k + 1. Cap k_dim at
++                # sc_top_k so pad_topk_ids/pad_topk_logps slice [:k] truncates the
++                # extra sampled-token entry, keeping all episodes at a uniform k.
++                sc_top_k = getattr(self.gconfig, "sc_top_k", 0)
++                k_dim = sc_top_k if sc_top_k > 0 else raw_max_k
++                # Raise if the sampler returned fewer top-k entries
++                # than sc_top_k requires — the SC correction needs a
++                # complete top-k head to estimate the tail mass ratio.
++                if sc_top_k > 0 and raw_max_k < sc_top_k:
++                    raise RuntimeError(
++                        f"Score Centering requires sc_top_k={sc_top_k} "
++                        f"but the sampler returned only {raw_max_k} "
++                        "top-k entries. Increase vLLM max_logprobs or "
++                        "reduce sc_top_k."
++                    )
++                # Pad absent slots with id 0 and log-prob -inf (zero mass).
++                input_topk_ids = [
++                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
++                ]
++                input_topk_logps = [
++                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
++                ]
++                output_topk_ids = [
++                    pad_topk_ids(ids, k_dim) for ids in resp.output_topk_ids
++                ]
++                output_topk_logps = [
++                    pad_topk_logps(logps, k_dim) for logps in resp.output_topk_logps
++                ]
++                res["sampler_topk_token_ids"] = torch.tensor(
++                    input_topk_ids + output_topk_ids, dtype=torch.int32
++                )  # [seq_len, k]
++                res["sampler_topk_logps"] = torch.tensor(
++                    input_topk_logps + output_topk_logps, dtype=torch.float32
++                )  # [seq_len, k]
++
++        result = {k: v.unsqueeze(0) for k, v in res.items()}
++
++        return result
+-- 
+2.50.1.windows.1
+
