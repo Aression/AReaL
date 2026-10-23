@@ -29,9 +29,9 @@ The fix replaces `dict(full_attention=None, ...)` with `None`, which lets HF tra
 
 This bug exists in the baseline (`ma-ascend-v1.0.5`) and in the upstream `ascend` branch. Upstream issue #1557 and PR #1558 report the same root cause with an identical fix.
 
-### Experimental validation (1000 steps, 4 configurations)
+### Experimental validation
 
-A 2x2 matrix experiment (SC on/off x recompute on/off, 1000 steps each) was run on Qwen2.5-1.5B-Instruct (bf16, eager attention) with GSM8K GRPO on Ascend 910 NPU.
+A controlled experiment (SC on/off x recompute_logprob on/off, 1000 training steps each) was run on Qwen2.5-1.5B-Instruct (bf16, eager attention) with GSM8K GRPO on Ascend 910 NPU.
 
 **TIM elimination** (attention mask fix):
 
@@ -44,12 +44,12 @@ A 2x2 matrix experiment (SC on/off x recompute on/off, 1000 steps each) was run 
 
 **Reward — SC-on outperforms SC-off**:
 
-| Phase | SC-on (avg) | SC-off (avg) | Advantage |
-|-------|-------------|-------------|-----------|
-| Step 0-99 | 0.464 | 0.461 | +0.003 |
-| Step 200-499 | 0.767 | 0.739 | +0.027 |
-| Step 500-799 | 0.814 | 0.763 | +0.052 |
-| Step 800-957 | 0.782 | 0.559 | +0.223 |
+| Training steps | SC-on (avg) | SC-off (avg) | Advantage |
+|----------------|-------------|-------------|-----------|
+| 0-99 | 0.464 | 0.461 | +0.003 |
+| 200-499 | 0.767 | 0.739 | +0.027 |
+| 500-799 | 0.814 | 0.763 | +0.052 |
+| 800-957 | 0.782 | 0.559 | +0.223 |
 
 Final reward: SC-on 0.790-0.802 vs SC-off 0.699-0.490 (SC-off+recompute-on crashed at step 958).
 
@@ -65,7 +65,7 @@ Final reward: SC-on 0.790-0.802 vs SC-off 0.699-0.490 (SC-off+recompute-on crash
 
 ![SC reward advantage by phase](sc_effect_by_phase.png)
 
-![SC tail model health (pre-fix vs post-fix)](sc_tail_model_health.png)
+![SC tail model health (before vs after fix)](sc_tail_model_health.png)
 
 ![SC drift tracking (s_bar vs correction)](sc_drift_tracking.png)
 
@@ -175,7 +175,7 @@ actor.py grpo_loss_fn:
 | Pure-Python SC math verification (`verify_sc_math.py`) | Pass (12/12) |
 | Attention mask fix verification (`verify_attention_mask_fix.py`) | Pass (3/3) |
 | 2-step NPU smoke (Ascend 910, vLLM 0.23.0) | Pass — `Training completes!`, 0 NaN/Inf, SC correction non-zero |
-| 1000-step 2x2 matrix (4 configurations) | SC-on stable; SC-off+recompute-on crashed at step 958 |
+| Full-scale training (4 configurations, 1000 steps each) | SC-on stable; SC-off+recompute-on crashed at step 958 |
 
 ### Compatibility
 
