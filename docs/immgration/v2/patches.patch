@@ -1,0 +1,866 @@
+From c7a05eab3f391b0e8b4d2e91c61d82069f5b0f8f Mon Sep 17 00:00:00 2001
+From: lvdi <l00993886@china.huawei.com>
+Date: Mon, 26 Oct 2026 09:57:47 +0800
+Subject: [PATCH] temp: PR1797 review fixes v2
+
+---
+ areal/api/cli_args.py               | 113 ++++++----
+ areal/experimental/openai/client.py |   2 +
+ areal/experimental/openai/types.py  |  20 +-
+ areal/trainer/ppo/actor.py          | 125 +++++++----
+ areal/utils/data.py                 |  19 +-
+ areal/utils/score_centering.py      |  26 +--
+ tests/test_score_centering.py       | 324 ++++++++++++++++++++++++++++
+ 7 files changed, 534 insertions(+), 95 deletions(-)
+ create mode 100644 tests/test_score_centering.py
+
+diff --git a/areal/api/cli_args.py b/areal/api/cli_args.py
+index a6f4cd0d..8de42e92 100644
+--- a/areal/api/cli_args.py
++++ b/areal/api/cli_args.py
+@@ -1771,17 +1771,25 @@ class PPOActorConfig(TrainEngineConfig):
+     sc_mode: str = field(
+         default="none",
+         metadata={
+-            "help": "SC + IS combination mode: 'none' (pure SC), 'tis' (truncated IS), 'mis' (mixture IS; not yet implemented, raises at runtime).",
++            "help": "SC + IS combination mode: 'none' (pure SC), 'tis' (truncated IS), 'mis' (mixture IS / IcePop band-masked importance sampling).",
+             "choices": ["none", "tis", "mis"],
+         },
+     )
+     sc_clip_low: float = field(
+-        default=0.0,
+-        metadata={"help": "Lower bound for SC IS ratio clipping."},
++        default=0.5,
++        metadata={
++            "help": "Lower bound for SC IS ratio clipping. Default 0.5 "
++            "matches the IcePop paper. When sc_mode='none' (pure SC), "
++            "this value is unused."
++        },
+     )
+     sc_clip_high: float = field(
+         default=float("inf"),
+-        metadata={"help": "Upper bound for SC IS ratio clipping."},
++        metadata={
++            "help": "Upper bound for SC IS ratio clipping. Default inf "
++            "(no upper clip). Set to a finite value (e.g. 5.0) when "
++            "using sc_mode='tis' or 'mis'."
++        },
+     )
+     sc_reinforce_baseline: bool = field(
+         default=False,
+@@ -1794,6 +1802,20 @@ class PPOActorConfig(TrainEngineConfig):
+             "use_score_centering=False (SC-off)."
+         },
+     )
++    sc_loss_mode: str = field(
++        default="reinforce",
++        metadata={
++            "help": "Loss integration mode for Score Centering: "
++            "'reinforce' (Plan A, default) — replace PPO with REINFORCE+SC; "
++            "'ppo_additive' (Plan B) — keep PPO clipped surrogate and add "
++            "SC correction as an additive term. Plan A is for paper "
++            "reproduction / strong-TIM scenarios; Plan B is for production "
++            "stability with recompute_logprob=true + async RL, where PPO "
++            "clip controls θ_now/θ_sync staleness variance orthogonally to "
++            "SC's θ_now/θ_rollout drift correction.",
++            "choices": ["reinforce", "ppo_additive"],
++        },
++    )
+ 
+     # Logging Agent Trajectories
+     log_agent_stats: bool = field(
+@@ -1893,46 +1915,63 @@ class PPOActorConfig(TrainEngineConfig):
+                     "SAPO is not compatible with `use_decoupled_loss=True`. "
+                     "Please set `actor.use_decoupled_loss=false` in your configuration."
+                 )
+-
+-        # Validate Score Centering configuration
+-        if self.sc_mode not in ("none", "tis", "mis"):
+-            raise ValueError(
+-                f"sc_mode must be 'none', 'tis', or 'mis'; got {self.sc_mode!r}."
+-            )
+-        if self.sc_clip_low >= self.sc_clip_high:
+-            raise ValueError(
+-                "sc_clip_low must be strictly less than sc_clip_high; "
+-                f"got {self.sc_clip_low} >= {self.sc_clip_high}."
+-            )
+-        # tis mode requires finite sc_clip_high (otherwise weight_fn=identity,
+-        # correction degenerates to 0 and pad slots produce 0*inf=NaN).
+-        if self.use_score_centering and self.sc_mode == "tis":
+-            import math
+-
+-            if not math.isfinite(self.sc_clip_high):
++            if self.sc_reinforce_baseline:
+                 raise ValueError(
+-                    "sc_mode='tis' requires finite sc_clip_high "
+-                    f"(got {self.sc_clip_high}); use 'none' for pure SC."
++                    "sc_reinforce_baseline=True is not compatible with "
++                    "use_sapo_loss=True. SAPO and REINFORCE baseline are "
++                    "mutually exclusive main losses. Set sc_reinforce_baseline=False "
++                    "or use_sapo_loss=False."
+                 )
+-        # mis mode requires finite sc_clip_low and sc_clip_high, and low >= 0.
+-        if self.use_score_centering and self.sc_mode == "mis":
+-            import math
+ 
+-            if not (
+-                math.isfinite(self.sc_clip_low) and math.isfinite(self.sc_clip_high)
+-            ):
+-                raise ValueError(
+-                    "sc_mode='mis' requires finite sc_clip_low and sc_clip_high "
+-                    f"(got low={self.sc_clip_low}, high={self.sc_clip_high})."
+-                )
+-            if self.sc_clip_low < 0:
++        # Validate Score Centering configuration.
++        # sc_loss_mode is validated unconditionally (cheap, and the field
++        # has a valid default so it should always pass for non-SC users).
++        if self.sc_loss_mode not in ("reinforce", "ppo_additive"):
++            raise ValueError(
++                f"sc_loss_mode must be 'reinforce' or 'ppo_additive'; "
++                f"got {self.sc_loss_mode!r}."
++            )
++        # All other SC fields (sc_mode, sc_clip_*) are only validated when SC
++        # is enabled, so SC-off users with stale/unset SC config don't hit
++        # confusing errors.
++        if self.use_score_centering:
++            if self.sc_mode not in ("none", "tis", "mis"):
+                 raise ValueError(
+-                    f"sc_mode='mis' requires sc_clip_low >= 0 (got {self.sc_clip_low})."
++                    f"sc_mode must be 'none', 'tis', or 'mis'; got {self.sc_mode!r}."
+                 )
+-            if self.sc_clip_high <= 0:
++            if self.sc_clip_low >= self.sc_clip_high:
+                 raise ValueError(
+-                    f"sc_mode='mis' requires sc_clip_high > 0 (got {self.sc_clip_high})."
++                    "sc_clip_low must be strictly less than sc_clip_high; "
++                    f"got {self.sc_clip_low} >= {self.sc_clip_high}."
+                 )
++            # tis mode requires finite sc_clip_low and sc_clip_high (two-sided
++            # clamp; infinite bounds make clamp a no-op on that side).
++            if self.sc_mode == "tis":
++                if not (
++                    math.isfinite(self.sc_clip_low) and math.isfinite(self.sc_clip_high)
++                ):
++                    raise ValueError(
++                        "sc_mode='tis' requires finite sc_clip_low and "
++                        f"sc_clip_high (got low={self.sc_clip_low}, "
++                        f"high={self.sc_clip_high}); use 'none' for pure SC."
++                    )
++            # mis mode requires finite sc_clip_low and sc_clip_high, and low >= 0.
++            if self.sc_mode == "mis":
++                if not (
++                    math.isfinite(self.sc_clip_low) and math.isfinite(self.sc_clip_high)
++                ):
++                    raise ValueError(
++                        "sc_mode='mis' requires finite sc_clip_low and sc_clip_high "
++                        f"(got low={self.sc_clip_low}, high={self.sc_clip_high})."
++                    )
++                if self.sc_clip_low < 0:
++                    raise ValueError(
++                        f"sc_mode='mis' requires sc_clip_low >= 0 (got {self.sc_clip_low})."
++                    )
++                if self.sc_clip_high <= 0:
++                    raise ValueError(
++                        f"sc_mode='mis' requires sc_clip_high > 0 (got {self.sc_clip_high})."
++                    )
+ 
+         # SC + unsupported combinations fail fast.
+         if self.use_score_centering:
+diff --git a/areal/experimental/openai/client.py b/areal/experimental/openai/client.py
+index 218ec2e4..9c2423ac 100644
+--- a/areal/experimental/openai/client.py
++++ b/areal/experimental/openai/client.py
+@@ -1043,6 +1043,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
+             interaction = InteractionWithTokenLogpReward(
+                 messages=deepcopy(messages_list),  # Store a copy of the input messages
+                 chat_template_type=self.chat_template_type,
++                sc_top_k=self.sc_top_k,
+             )
+             cache[completion_id] = interaction
+ 
+@@ -1526,6 +1527,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
+         interaction = InteractionWithTokenLogpReward(
+             messages=deepcopy(messages_list),  # Store a copy of the input messages
+             chat_template_type=self.chat_template_type,
++            sc_top_k=self.sc_top_k,
+             input_data=(
+                 deepcopy(input) if not is_omitted(input) else ""
+             ),  # Store a copy of the input data
+diff --git a/areal/experimental/openai/types.py b/areal/experimental/openai/types.py
+index 47f5a1bf..edb00171 100644
+--- a/areal/experimental/openai/types.py
++++ b/areal/experimental/openai/types.py
+@@ -70,6 +70,11 @@ class InteractionWithTokenLogpReward:
+     trajectory_metadata: dict[str, str] = field(default_factory=dict)
+     _cache: dict[str, torch.Tensor] | None = None
+ 
++    # Score Centering: the sc_top_k from the engine config, used in
++    # to_tensor_dict() to cap k_dim (mirrors rlvr.py's k_dim logic).  Set by
++    # the client when creating the interaction; 0 = SC disabled.
++    sc_top_k: int = 0
++
+     # Vision payload for VLM training. ``mm_token_type_ids`` covers the prompt
+     # only (it is extended with zeros over the output at tensor-dict time);
+     # ``multi_modal_input`` holds a single dict for the whole sequence, matching
+@@ -276,7 +281,20 @@ class InteractionWithTokenLogpReward:
+                 max(len(k) for k in resp.output_topk_ids) if resp.output_topk_ids else 0
+             )
+             if pad_k > 0:
+-                k_dim = pad_k
++                # Cap k_dim at sc_top_k to match rlvr.py's logic: vLLM returns
++                # 1+N entries (sampled token + top-N), so pad_k may be
++                # sc_top_k + 1.  Without this cap, OpenAI-path trajectories
++                # would have k_dim=sc_top_k+1 while rlvr.py trajectories have
++                # k_dim=sc_top_k, causing dimension mismatch when batched.
++                sc_top_k = self.sc_top_k
++                k_dim = sc_top_k if sc_top_k > 0 else pad_k
++                if sc_top_k > 0 and pad_k < sc_top_k:
++                    raise RuntimeError(
++                        f"Score Centering requires sc_top_k={sc_top_k} "
++                        f"but the sampler returned only {pad_k} "
++                        "top-k entries. Increase vLLM max_logprobs or "
++                        "reduce sc_top_k."
++                    )
+                 # Input tokens have no sampler data. Pad ids with 0 and
+                 # log-probs with -inf so they contribute zero mass.
+                 input_topk_ids = [
+diff --git a/areal/trainer/ppo/actor.py b/areal/trainer/ppo/actor.py
+index c3afa16f..de03e89e 100644
+--- a/areal/trainer/ppo/actor.py
++++ b/areal/trainer/ppo/actor.py
+@@ -232,12 +232,9 @@ class PPOActor:
+         else:
+             old_logp = torch.roll(data["logprobs"], shifts=-1, dims=-1)
+             # When recompute_logprob=false, old_logp comes from vLLM inference.
+-            # The data.py -inf padding for "logprobs" correctly zeroes q_mass
+-            # (exp(-inf)=0), but -inf flows into prox_logp and triggers the
+-            # NaN/Inf safety check in _resolve_proximal_logp. Sanitize to a
+-            # large negative finite value; padding positions are masked by
+-            # loss_mask in subsequent PPO/SC computations.
+-            old_logp = torch.nan_to_num(old_logp, neginf=-1e4, nan=-1e4)
++            # data.py pads "logprobs" with 0.0 (default pad_value), so padded
++            # slots are already 0.0 — no sanitization needed.  Padded positions
++            # are masked by loss_mask in subsequent PPO/SC computations.
+             data["logprobs"] = old_logp
+             if not self.config.use_decoupled_loss:
+                 # prox logp not available, use inferenced logp
+@@ -307,7 +304,6 @@ class PPOActor:
+         for key in (
+             "sampler_topk_logps",
+             "sampler_topk_token_ids",
+-            "sampler_topk_mask",
+         ):
+             if key in data and data[key] is not None:
+                 data[key] = torch.roll(data[key], shifts=-1, dims=1)
+@@ -453,6 +449,7 @@ class PPOActor:
+                         sc_clip_high=self.config.sc_clip_high,
+                         sc_temperature=self.config.temperature,
+                         sc_reinforce_baseline=self.config.sc_reinforce_baseline,
++                        sc_loss_mode=self.config.sc_loss_mode,
+                     ),
+                     loss_weight_fn=loss_step.normalizer_fn,
+                 )
+@@ -612,6 +609,7 @@ def grpo_loss_fn(
+     sc_clip_high: float = float("inf"),
+     sc_temperature: float = 1.0,
+     sc_reinforce_baseline: bool = False,
++    sc_loss_mode: str = "reinforce",
+ ):
+     """Loss function for actor step, all inputs should be splitted into
+     pipeline micro batches, returns loss and logging stats."""
+@@ -678,14 +676,19 @@ def grpo_loss_fn(
+         )
+ 
+     # === Score Centering (SC) correction ===
+-    # Plan A (REINFORCE+SC): when SC is enabled and SC data is available,
+-    # replace the PPO loss entirely with a REINFORCE+SC loss:
++    # Plan A (sc_loss_mode="reinforce", default): when SC is enabled and SC
++    # data is available, replace the PPO loss entirely with a REINFORCE+SC loss:
+     #   ℓ = -A·log p(a) + A·correction
+     # The first term is pure REINFORCE (no PPO ratio, no clipping); the
+     # second term is the SC additive drift correction. This matches the
+-    # official SC paper's integration (REINFORCE+SC) rather than appending
+-    # SC on top of PPO (Plan B), which produces gradient inconsistency
+-    # when ratio≠1 (recompute=false).
++    # official SC paper's integration (REINFORCE+SC).
++    #
++    # Plan B (sc_loss_mode="ppo_additive"): keep the PPO clipped surrogate and
++    # add the SC correction as an additive term:
++    #   ℓ = PPO_clipped_surrogate + A·correction
++    # Useful for production stability with recompute_logprob=true + async RL,
++    # where PPO clip controls θ_now/θ_sync staleness variance orthogonally to
++    # SC's θ_now/θ_rollout drift correction.
+     #
+     # When sc_reinforce_baseline=True and SC is off, use pure REINFORCE
+     # (-A·log p(a)) as the baseline loss instead of PPO, enabling a fair
+@@ -702,6 +705,13 @@ def grpo_loss_fn(
+     # PPO's computation but the actual loss is REINFORCE+SC — they are logged
+     # for observability but should not be interpreted as the training signal.
+     sc_loss_overridden = False
++    # loss_mode: a scalar string metric for dashboards to identify the actual
++    # loss path used.  "ppo" = PPO clipped surrogate (SC off, no baseline);
++    # "reinforce_sc" = REINFORCE + SC (Plan A, SC on); "reinforce_baseline" =
++    # pure REINFORCE (SC off, sc_reinforce_baseline=True); "ppo_sc" = PPO +
++    # SC additive (Plan B, SC on).  PPO stat fields (clip_ratio, etc.) are
++    # only meaningful when loss_mode starts with "ppo".
++    loss_mode = "ppo"
+     if use_score_centering:
+         sampler_topk_logps = input_data.get("sampler_topk_logps")
+         sampler_topk_token_ids = input_data.get("sampler_topk_token_ids")
+@@ -731,43 +741,72 @@ def grpo_loss_fn(
+                 ) = score_centering_correction(
+                     train_head_logp=train_head_logp,
+                     sampler_topk_logps=sampler_topk_logps,
+-                    sampler_topk_mask=input_data.get("sampler_topk_mask"),
+                     sc_mode=sc_mode,
+                     sc_clip_low=sc_clip_low,
+                     sc_clip_high=sc_clip_high,
+                 )  # each [batch, seq]
+ 
+-            # Plan A: REINFORCE + SC independent path.
+-            #   ℓ = -A·log p(a) + A·correction
+-            # REINFORCE term: -advantage * logp (pure policy gradient, no ratio).
+-            # SC term: advantage * correction (additive drift correction).
+-            # Both terms are advantage-weighted so gradient direction is tied
+-            # to the reward signal. advantage is already computed and detached.
+-            pg_term = (
+-                -advantages.detach() * logprobs
+-            )  # -A·log p(a), grad through logprobs
++            # Plan A (reinforce): ℓ = -A·log p(a) + A·correction
++            #   Replace PPO loss entirely with REINFORCE + SC additive correction.
++            #   The first term is pure REINFORCE (no PPO ratio, no clipping); the
++            #   second is the SC drift correction.  Matches the SC paper's
++            #   integration.  Best for paper reproduction / strong-TIM scenarios.
++            #
++            # Plan B (ppo_additive): ℓ = PPO_clipped_surrogate + A·correction
++            #   Keep the PPO clipped surrogate loss and add the SC correction as
++            #   an additive term.  Best for production with recompute_logprob=true
++            #   + async RL, where PPO clip controls θ_now/θ_sync staleness
++            #   variance orthogonally to SC's θ_now/θ_rollout drift correction.
+             sc_term = advantages.detach() * sc_correction  # A·correction
+-            combined = torch.where(
+-                loss_mask,
+-                pg_term + sc_term,
+-                torch.zeros_like(pg_term),
+-            )
+-            loss = pg_reduction.aggregate(
+-                combined,
+-                loss_mask,
+-                denominator_mask=denominator_mask,
+-                cu_seqlens=input_data.get("cu_seqlens"),
+-                unit_weights=input_data.get("unit_weights"),
+-            )
++            if sc_loss_mode == "reinforce":
++                # Plan A: REINFORCE + SC
++                pg_term = (
++                    -advantages.detach() * logprobs
++                )  # -A·log p(a), grad through logprobs
++                combined = torch.where(
++                    loss_mask,
++                    pg_term + sc_term,
++                    torch.zeros_like(pg_term),
++                )
++                loss = pg_reduction.aggregate(
++                    combined,
++                    loss_mask,
++                    denominator_mask=denominator_mask,
++                    cu_seqlens=input_data.get("cu_seqlens"),
++                    unit_weights=input_data.get("unit_weights"),
++                )
++                sc_loss_overridden = True
++                loss_mode = "reinforce_sc"
++            else:
++                # Plan B: PPO clipped surrogate + SC (additive)
++                # loss is already the PPO clipped surrogate from
++                # ppo_actor_loss_fn above; add the SC correction term.
++                sc_combined = torch.where(
++                    loss_mask,
++                    sc_term,
++                    torch.zeros_like(sc_term),
++                )
++                sc_additive = pg_reduction.aggregate(
++                    sc_combined,
++                    loss_mask,
++                    denominator_mask=denominator_mask,
++                    cu_seqlens=input_data.get("cu_seqlens"),
++                    unit_weights=input_data.get("unit_weights"),
++                )
++                loss = loss + sc_additive
++                sc_loss_overridden = False  # PPO stats are still meaningful
++                loss_mode = "ppo_sc"
+             sc_loss = sc_term.detach()  # for logging
+-            sc_loss_overridden = True
+         else:
+-            logger.warning(
+-                "use_score_centering=True but SC correction skipped: "
++            raise RuntimeError(
++                "use_score_centering=True but SC correction cannot be computed: "
+                 f"sampler_topk_logps={'present' if sampler_topk_logps is not None else 'MISSING'}, "
+                 f"sampler_topk_token_ids={'present' if sampler_topk_token_ids is not None else 'MISSING'}, "
+                 f"logits={'present' if train_logits is not None else 'MISSING'}; "
+-                f"input_data keys={list(input_data.keys())[:18]}"
++                f"input_data keys={list(input_data.keys())[:18]}. "
++                "This usually means the sampler did not return top-k logprobs. "
++                "Check that vLLM/SGLang is configured with max_logprobs >= sc_top_k. "
++                "Set use_score_centering=False if SC is not available."
+             )
+     elif sc_reinforce_baseline:
+         # A1 baseline: pure REINFORCE (-A·log p(a)), no PPO ratio, no clipping.
+@@ -786,6 +825,7 @@ def grpo_loss_fn(
+             unit_weights=input_data.get("unit_weights"),
+         )
+         sc_loss_overridden = True
++        loss_mode = "reinforce_baseline"
+ 
+     # Joint Distillation KL Loss
+     teacher_logp = input_data.get("teacher_logp")
+@@ -894,6 +934,15 @@ def grpo_loss_fn(
+         dual_clip_ratio=stat["dual_clip_mask"].float(),
+         denominator="n_valid_tokens",
+     )
++    # loss_mode: scalar string identifying the actual loss path.  PPO stat
++    # fields (clip_ratio, importance_weight, etc.) are only meaningful when
++    # loss_mode starts with "ppo"; dashboards should annotate accordingly.
++    stats_tracker.scalar(loss_mode=loss_mode)
++    # sc_active: 1 if SC correction was applied this step, 0 otherwise.
++    # Alert if use_score_centering=True but sc_active=0 persists — SC was
++    # skipped (data missing → RuntimeError raised, so this should never be 0
++    # when SC is on; 1 means SC correction was computed).
++    stats_tracker.scalar(sc_active=1 if sc_correction is not None else 0)
+     if "behave_imp_weight" in stat:
+         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
+         stats_tracker.stat(
+diff --git a/areal/utils/data.py b/areal/utils/data.py
+index 4e26fbaa..95d14244 100644
+--- a/areal/utils/data.py
++++ b/areal/utils/data.py
+@@ -349,12 +349,15 @@ def concat_padded_tensors(
+         if isinstance(values[0], torch.Tensor):
+             if key == "attention_mask":
+                 pv = 0.0
+-            elif key in ("sampler_topk_logps", "ref_logprobs", "logprobs"):
+-                # Explicit whitelist for logprob keys that need -inf padding.
+-                # Previously used substring match ("_logps" in key) which also
+-                # matched ref_logprobs correctly but could false-match future keys.
+-                # exp(-inf) == 0 so padded slots contribute no probability mass;
+-                # exp(0.0) == 1 would silently inflate q_mass (see score_centering).
++            elif key == "sampler_topk_logps":
++                # Only the SC-specific sampler top-k logprobs need -inf padding:
++                # exp(-inf) == 0 ensures padded slots contribute zero probability
++                # mass in score_centering's q_mass computation.  Other logprob
++                # keys ("logprobs", "ref_logprobs") are masked by loss_mask in
++                # downstream PPO/DPO/SC computations, so they keep the default
++                # 0.0 padding — using -inf there would produce -inf*0=NaN in
++                # DPO's dpo_pair_logratios (ref_logprobs * shifted_mask) and
++                # require a compensating nan_to_num in PPO's actor.py.
+                 pv = float("-inf")
+             else:
+                 pv = pad_value
+@@ -873,8 +876,10 @@ def split_padded_tensor_dict_into_mb_list(
+                 # Score Centering: also split 3D tensors [bs, max_seqlen, k] (e.g.
+                 # sampler_topk_logps/token_ids) so pack_tensor_dict can pack them
+                 # to [total_tokens, k], matching logits/loss_mask seq dimension.
++                # Use ndim >= 3 to avoid false-matching 2D tensors that happen to
++                # have shape [bs, max_seqlen] (already covered by numel check).
+                 torch.is_tensor(value)
+-                and value.ndim >= 2
++                and value.ndim >= 3
+                 and value.shape[0] == bs
+                 and value.shape[1] == max_seqlen
+             )
+diff --git a/areal/utils/score_centering.py b/areal/utils/score_centering.py
+index 78064651..8be0444a 100644
+--- a/areal/utils/score_centering.py
++++ b/areal/utils/score_centering.py
+@@ -165,13 +165,19 @@ def _build_weight_fn(
+     """Build the IS weight function shared by head and tail (after VeRL).
+ 
+     - "none": identity (pure SC, no IS) -> weight_fn(r) = 1
+-    - "tis": upper-clamp -> weight_fn(r) = r.clamp(max=sc_clip_high)
+-    - "mis": band-mask (IcePop) -> weight_fn(r) = where(low<=r<=high, r, 0)
++    - "tis": two-sided truncated IS -> weight_fn(r) = r.clamp(low, high)
++      (VeRL-compatible; the original single-sided ``clamp(max=high)`` was
++      missing the lower bound clip that "truncated" semantics require.)
++    - "mis": band-masked IS (IcePop) -> weight_fn(r) = where(low<=r<=high, r, 0)
++      When ``sc_clip_low=0`` (the dataclass default), MIS degenerates to a
++      hard-clip-at-high variant of TIS — set ``sc_clip_low=0.5`` for the
++      IcePop paper default.
+     """
+     if sc_mode == "none":
+         return torch.ones_like
+     if sc_mode == "tis":
+-        return lambda ratio: ratio.clamp(max=sc_clip_high)
++        low, high = sc_clip_low, sc_clip_high
++        return lambda ratio: ratio.clamp(min=low, max=high)
+     if sc_mode == "mis":
+         low, high = sc_clip_low, sc_clip_high
+         return lambda ratio: torch.where(
+@@ -183,9 +189,8 @@ def _build_weight_fn(
+ def score_centering_correction(
+     train_head_logp: torch.Tensor,
+     sampler_topk_logps: torch.Tensor,
+-    sampler_topk_mask: torch.Tensor | None = None,
+     sc_mode: str = "none",
+-    sc_clip_low: float = 0.0,
++    sc_clip_low: float = 0.5,
+     sc_clip_high: float = float("inf"),
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Compute the additive Score Centering correction.
+@@ -207,7 +212,6 @@ def score_centering_correction(
+             **Gradient flows through this tensor only.**
+         sampler_topk_logps: ``[batch, seq, k]`` — sampler log-probs for the
+             same top-k tokens. **Detached** (no gradient to inference engine).
+-        sampler_topk_mask: ``[batch, seq, k]`` — optional mask (1 = valid).
+         sc_mode: "none" (pure SC) | "tis" (truncated IS) | "mis" (mixture IS).
+         sc_clip_low / sc_clip_high: bounds for IS ratio clipping (tis/mis).
+ 
+@@ -234,12 +238,10 @@ def score_centering_correction(
+ 
+     q = torch.exp(q_logp)  # [batch, seq, k]
+ 
+-    # Self-evident mask: -inf logprob slots are invalid (pad). Fall back to
+-    # finiteness of the sampler logprob when no explicit mask is provided.
+-    if sampler_topk_mask is not None:
+-        valid = sampler_topk_mask.detach().bool()
+-    else:
+-        valid = torch.isfinite(q_logp)
++    # Self-evident mask: -inf logprob slots are invalid (pad).  The sampler
++    # pads absent top-k slots with -inf (see pad_topk_logps), so finiteness
++    # of the sampler logprob is a reliable validity indicator.
++    valid = torch.isfinite(q_logp)
+     mask = valid.float()  # [batch, seq, k]
+ 
+     # Apply mask: a masked slot must contribute zero mass, not exp(0)=1.
+diff --git a/tests/test_score_centering.py b/tests/test_score_centering.py
+new file mode 100644
+index 00000000..2ed84725
+--- /dev/null
++++ b/tests/test_score_centering.py
+@@ -0,0 +1,324 @@
++# SPDX-License-Identifier: Apache-2.0
++
++"""Tests for Score Centering (SC) drift correction.
++
++Covers:
++  - _TopKLogProbsFromLogits forward/backward correctness
++  - score_centering_correction on-policy no-op (value + gradient)
++  - score_centering_correction pad-slot safety (no NaN)
++  - gather_train_head_logp equivalence to log_softmax + gather
++  - Config validation (sc_loss_mode, sc_mode constraints)
++  - data.py concat_padded_tensors: only sampler_topk_logps gets -inf
++"""
++
++import pytest
++import torch
++
++from areal.utils.data import concat_padded_tensors
++from areal.utils.score_centering import (
++    _TopKLogProbsFromLogits,
++    gather_train_head_logp,
++    score_centering_correction,
++)
++
++
++class TestTopKLogProbsFromLogits:
++    """Verify the chunked autograd Function matches log_softmax + gather."""
++
++    def test_forward_matches_log_softmax_gather(self):
++        torch.manual_seed(42)
++        n, vocab, k = 8, 100, 5
++        logits = torch.randn(n, vocab, dtype=torch.float64)
++        token_ids = torch.randint(0, vocab, (n, k))
++
++        expected = torch.log_softmax(logits, dim=-1).gather(-1, token_ids)
++        result = _TopKLogProbsFromLogits.apply(logits, token_ids, 4)  # chunk_size=4
++
++        torch.testing.assert_close(result, expected, rtol=1e-10, atol=1e-12)
++
++    def test_backward_gradient_correctness(self):
++        torch.manual_seed(42)
++        n, vocab, k = 6, 50, 3
++        logits = torch.randn(n, vocab, dtype=torch.float64, requires_grad=True)
++        token_ids = torch.randint(0, vocab, (n, k))
++
++        # Reference: log_softmax + gather
++        logits_ref = logits.detach().clone().requires_grad_(True)
++        ref = torch.log_softmax(logits_ref, dim=-1).gather(-1, token_ids)
++        ref.sum().backward()
++
++        # Our function
++        result = _TopKLogProbsFromLogits.apply(logits, token_ids, 0)
++        result.sum().backward()
++
++        torch.testing.assert_close(logits.grad, logits_ref.grad, rtol=1e-10, atol=1e-12)
++
++    def test_bf16_promoted_to_fp32(self):
++        n, vocab, k = 4, 30, 3
++        logits = torch.randn(n, vocab, dtype=torch.bfloat16)
++        token_ids = torch.randint(0, vocab, (n, k))
++
++        result = _TopKLogProbsFromLogits.apply(logits, token_ids, 0)
++        assert result.dtype == torch.float32
++
++
++class TestScoreCenteringCorrection:
++    """Verify SC correction math, on-policy no-op, and pad safety."""
++
++    @pytest.fixture
++    def on_policy_data(self):
++        """Create on-policy data where p == q (trainer == sampler)."""
++        torch.manual_seed(42)
++        batch, seq, k, vocab = 2, 4, 5, 100
++        logits = torch.randn(batch, seq, vocab, dtype=torch.float64)
++        log_probs = torch.log_softmax(logits, dim=-1)
++        # Top-k tokens and their log-probs
++        topk_vals, topk_ids = torch.topk(log_probs, k, dim=-1)
++        return {
++            "logits": logits,
++            "train_head_logp": topk_vals.clone(),  # p == q (on-policy)
++            "sampler_topk_logps": topk_vals.clone().detach(),  # q == p
++        }
++
++    def test_on_policy_is_exact_noop_value(self, on_policy_data):
++        """correction must be exactly 0 when p == q."""
++        correction, s_bar, q_mass, p_mass, rho = score_centering_correction(
++            train_head_logp=on_policy_data["train_head_logp"],
++            sampler_topk_logps=on_policy_data["sampler_topk_logps"],
++        )
++        assert correction.shape == (2, 4)
++        torch.testing.assert_close(correction, torch.zeros_like(correction))
++        torch.testing.assert_close(rho, torch.ones_like(rho))
++
++    def test_on_policy_is_exact_noop_gradient(self, on_policy_data):
++        """gradient of correction w.r.t. train_head_logp must be 0 when p==q."""
++        train_head_logp = on_policy_data["train_head_logp"].clone().requires_grad_(True)
++        correction, *_ = score_centering_correction(
++            train_head_logp=train_head_logp,
++            sampler_topk_logps=on_policy_data["sampler_topk_logps"],
++        )
++        correction.sum().backward()
++        # correction = residual * train_head_logp; residual = 0 on-policy
++        torch.testing.assert_close(
++            train_head_logp.grad, torch.zeros_like(train_head_logp.grad)
++        )
++
++    def test_pad_slots_produce_no_nan(self):
++        """-inf sampler logprobs (pad slots) must not produce NaN."""
++        batch, seq, k = 2, 3, 4
++        train_head_logp = torch.randn(batch, seq, k, dtype=torch.float64)
++        # Some slots padded with -inf (as done by pad_topk_logps)
++        sampler_topk_logps = torch.randn(batch, seq, k, dtype=torch.float64)
++        sampler_topk_logps[0, 2, :] = float("-inf")  # pad entire last position
++        sampler_topk_logps[1, 0, 2:] = float("-inf")  # pad 2 slots
++
++        correction, s_bar, q_mass, p_mass, rho = score_centering_correction(
++            train_head_logp=train_head_logp,
++            sampler_topk_logps=sampler_topk_logps,
++        )
++
++        assert not torch.isnan(correction).any(), "correction has NaN"
++        assert not torch.isnan(q_mass).any(), "q_mass has NaN"
++        assert not torch.isnan(p_mass).any(), "p_mass has NaN"
++        assert not torch.isnan(rho).any(), "rho has NaN"
++
++    def test_off_policy_correction_nonzero(self):
++        """When p != q, correction should be non-zero."""
++        torch.manual_seed(42)
++        batch, seq, k = 1, 2, 5
++        train_head_logp = torch.randn(batch, seq, k, dtype=torch.float64)
++        sampler_topk_logps = torch.randn(batch, seq, k, dtype=torch.float64)
++
++        correction, _, _, _, _ = score_centering_correction(
++            train_head_logp=train_head_logp,
++            sampler_topk_logps=sampler_topk_logps,
++        )
++        assert correction.abs().sum() > 0
++
++    def test_mis_mode_no_nan_with_clips(self):
++        """mis mode with finite clips should not produce NaN on valid data."""
++        torch.manual_seed(42)
++        batch, seq, k = 2, 3, 5
++        train_head_logp = torch.randn(batch, seq, k, dtype=torch.float64)
++        sampler_topk_logps = torch.randn(batch, seq, k, dtype=torch.float64)
++
++        correction, _, _, _, _ = score_centering_correction(
++            train_head_logp=train_head_logp,
++            sampler_topk_logps=sampler_topk_logps,
++            sc_mode="mis",
++            sc_clip_low=0.1,
++            sc_clip_high=5.0,
++        )
++        assert not torch.isnan(correction).any()
++
++
++class TestGatherTrainHeadLogp:
++    """Verify gather_train_head_logp matches log_softmax + gather."""
++
++    def test_matches_reference(self):
++        torch.manual_seed(42)
++        batch, seq, vocab, k = 2, 3, 50, 5
++        logits = torch.randn(batch, seq, vocab, dtype=torch.float64)
++        token_ids = torch.randint(0, vocab, (batch, seq, k))
++
++        result = gather_train_head_logp(logits, token_ids, temperature=1.0)
++        expected = torch.log_softmax(logits, dim=-1).gather(-1, token_ids)
++
++        torch.testing.assert_close(result, expected, rtol=1e-10, atol=1e-12)
++
++    def test_temperature_scaling(self):
++        """Temperature should scale logits before softmax."""
++        torch.manual_seed(42)
++        batch, seq, vocab, k = 1, 2, 30, 3
++        logits = torch.randn(batch, seq, vocab, dtype=torch.float64)
++        token_ids = torch.randint(0, vocab, (batch, seq, k))
++        temp = 0.7
++
++        result = gather_train_head_logp(logits, token_ids, temperature=temp)
++        expected = torch.log_softmax(logits / temp, dim=-1).gather(-1, token_ids)
++
++        torch.testing.assert_close(result, expected, rtol=1e-10, atol=1e-12)
++
++
++class TestConcatPaddedTensorsPadding:
++    """Verify that only sampler_topk_logps gets -inf padding (Finding 1 fix)."""
++
++    def test_logprobs_padded_with_zero(self):
++        """logprobs should be 0.0-padded, not -inf (DPO/PPO safety)."""
++        d1 = {"logprobs": torch.randn(3)}
++        d2 = {"logprobs": torch.randn(5)}
++        result = concat_padded_tensors([d1, d2])
++        padded = result["logprobs"]
++        # The first 3 values from d1, then 2 pad values
++        assert padded.shape[0] == 8
++        # Pad positions (indices 3-4) should be 0.0, not -inf
++        assert torch.all(padded[3:5] == 0.0), "logprobs pad should be 0.0, not -inf"
++
++    def test_ref_logprobs_padded_with_zero(self):
++        """ref_logprobs should be 0.0-padded (DPO NaN fix)."""
++        d1 = {"ref_logprobs": torch.randn(4)}
++        d2 = {"ref_logprobs": torch.randn(6)}
++        result = concat_padded_tensors([d1, d2])
++        padded = result["ref_logprobs"]
++        assert padded.shape[0] == 10
++        # Pad positions (indices 4-5) should be 0.0, not -inf
++        assert torch.all(padded[4:6] == 0.0), "ref_logprobs pad should be 0.0, not -inf"
++
++    def test_sampler_topk_logps_padded_with_neg_inf(self):
++        """sampler_topk_logps should be -inf-padded (SC correctness)."""
++        d1 = {"sampler_topk_logps": torch.randn(3)}
++        d2 = {"sampler_topk_logps": torch.randn(5)}
++        result = concat_padded_tensors([d1, d2])
++        padded = result["sampler_topk_logps"]
++        assert padded.shape[0] == 8
++        # Pad positions should be -inf
++        assert torch.all(padded[3:5] == float("-inf")), (
++            "sampler_topk_logps pad should be -inf"
++        )
++
++
++class TestSCConfigValidation:
++    """Verify PPOActorConfig validation for Score Centering fields."""
++
++    def test_sc_loss_mode_invalid_raises(self):
++        """Invalid sc_loss_mode should raise ValueError."""
++        from areal.api.cli_args import PPOActorConfig
++
++        with pytest.raises(ValueError, match="sc_loss_mode"):
++            PPOActorConfig(path="dummy", sc_loss_mode="invalid")
++
++    def test_sc_loss_mode_reinforce_default(self):
++        """Default sc_loss_mode should be 'reinforce'."""
++        from areal.api.cli_args import PPOActorConfig
++
++        config = PPOActorConfig(path="dummy")
++        assert config.sc_loss_mode == "reinforce"
++
++    def test_sc_loss_mode_ppo_additive_valid(self):
++        """sc_loss_mode='ppo_additive' should be accepted."""
++        from areal.api.cli_args import PPOActorConfig
++
++        config = PPOActorConfig(path="dummy", sc_loss_mode="ppo_additive")
++        assert config.sc_loss_mode == "ppo_additive"
++
++    def test_sc_mode_invalid_raises(self):
++        """Invalid sc_mode should raise ValueError."""
++        from areal.api.cli_args import PPOActorConfig
++
++        with pytest.raises(ValueError, match="sc_mode"):
++            PPOActorConfig(path="dummy", sc_mode="invalid")
++
++    def test_sc_reinforce_baseline_with_sc_on_raises(self):
++        """sc_reinforce_baseline=True + use_score_centering=True should raise."""
++        from areal.api.cli_args import PPOActorConfig
++
++        with pytest.raises(ValueError, match="sc_reinforce_baseline"):
++            PPOActorConfig(
++                path="dummy",
++                use_score_centering=True,
++                sc_reinforce_baseline=True,
++                sc_top_k=10,
++            )
++
++    def test_tis_mode_requires_finite_clips(self):
++        """tis mode with infinite clips should raise (two-sided clamp)."""
++        from areal.api.cli_args import PPOActorConfig
++
++        with pytest.raises(ValueError, match="tis.*finite"):
++            PPOActorConfig(
++                path="dummy",
++                use_score_centering=True,
++                sc_mode="tis",
++                sc_clip_high=float("inf"),
++                sc_top_k=10,
++            )
++
++    def test_tis_mode_requires_finite_low(self):
++        """tis mode with infinite sc_clip_low should raise."""
++        from areal.api.cli_args import PPOActorConfig
++
++        with pytest.raises(ValueError, match="tis.*finite"):
++            PPOActorConfig(
++                path="dummy",
++                use_score_centering=True,
++                sc_mode="tis",
++                sc_clip_low=float("inf"),
++                sc_clip_high=5.0,
++                sc_top_k=10,
++            )
++
++    def test_mis_mode_requires_finite_clips(self):
++        """mis mode with infinite clips should raise."""
++        from areal.api.cli_args import PPOActorConfig
++
++        with pytest.raises(ValueError, match="mis.*finite"):
++            PPOActorConfig(
++                path="dummy",
++                use_score_centering=True,
++                sc_mode="mis",
++                sc_clip_high=float("inf"),
++                sc_top_k=10,
++            )
++
++    def test_sapo_and_reinforce_baseline_mutual_exclusion(self):
++        """use_sapo_loss=True + sc_reinforce_baseline=True should raise."""
++        from areal.api.cli_args import PPOActorConfig
++
++        with pytest.raises(ValueError, match="sc_reinforce_baseline.*use_sapo_loss"):
++            PPOActorConfig(
++                path="dummy",
++                use_sapo_loss=True,
++                sc_reinforce_baseline=True,
++            )
++
++    def test_sc_off_does_not_validate_sc_mode(self):
++        """SC-off with invalid sc_mode should NOT raise (inert config)."""
++        from areal.api.cli_args import PPOActorConfig
++
++        # sc_mode='invalid' but use_score_centering=False — should not raise
++        config = PPOActorConfig(
++            path="dummy",
++            use_score_centering=False,
++            sc_mode="invalid",
++        )
++        assert config.sc_mode == "invalid"
+-- 
+2.50.1.windows.1
+
