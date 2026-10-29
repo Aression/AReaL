@@ -230,6 +230,77 @@ class TestConcatPaddedTensorsPadding:
         )
 
 
+@pytest.mark.parametrize(
+    "use_sc,reinforce_baseline,sc_loss_mode,expected_mode",
+    [
+        (False, False, "reinforce", 0),
+        (True, False, "reinforce", 1),
+        (False, True, "reinforce", 2),
+        (True, False, "ppo_additive", 3),
+    ],
+)
+def test_actor_loss_modes_export_numeric_metrics_and_backpropagate(
+    monkeypatch, use_sc, reinforce_baseline, sc_loss_mode, expected_mode
+):
+    """Each loss path must work with the real numeric-only stats tracker."""
+    from areal.trainer.ppo import actor as actor_module
+    from areal.utils.stats_tracker import DistributedStatsTracker
+
+    torch.manual_seed(42)
+    logits = torch.randn(1, 3, 7, requires_grad=True)
+    token_ids = torch.tensor([[[1], [2], [3]]])
+    logprobs = logits.log_softmax(-1).gather(-1, token_ids).squeeze(-1)
+    advantages = torch.tensor([[1.0, -0.5, 0.75]])
+    input_data = {
+        "logprobs": logprobs.detach(),
+        "prox_logp": logprobs.detach(),
+        "advantages": advantages,
+        "loss_mask": torch.ones_like(logprobs, dtype=torch.bool),
+    }
+    correction = torch.zeros_like(logprobs)
+    if use_sc:
+        sampler_logprobs = (
+            logits.detach() + torch.linspace(-0.3, 0.3, logits.shape[-1])
+        ).log_softmax(-1)
+        topk_logprobs, topk_ids = sampler_logprobs.topk(3, dim=-1)
+        input_data.update(
+            logits=logits,
+            sampler_topk_logps=topk_logprobs,
+            sampler_topk_token_ids=topk_ids,
+        )
+        correction, *_ = score_centering_correction(
+            gather_train_head_logp(logits, topk_ids), topk_logprobs
+        )
+
+    tracker = DistributedStatsTracker()
+    monkeypatch.setattr(actor_module, "stats_tracker", tracker)
+    loss = actor_module.grpo_loss_fn(
+        logprobs=logprobs,
+        entropy=torch.zeros_like(logprobs),
+        input_data=input_data,
+        eps_clip=0.2,
+        eps_clip_higher=None,
+        c_clip=None,
+        use_score_centering=use_sc,
+        sc_reinforce_baseline=reinforce_baseline,
+        sc_loss_mode=sc_loss_mode,
+    )
+
+    if reinforce_baseline or (use_sc and sc_loss_mode == "reinforce"):
+        expected = (-advantages * logprobs).mean()
+    else:
+        expected = -advantages.mean()
+    if use_sc:
+        expected = expected + (advantages * correction).mean()
+    torch.testing.assert_close(loss, expected, rtol=1e-5, atol=1e-6)
+    loss.backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+    metrics = tracker.export()
+    assert metrics["loss_mode"] == expected_mode
+    assert metrics["sc_active"] == int(use_sc)
+
+
 class TestSCConfigValidation:
     """Verify PPOActorConfig validation for Score Centering fields."""
 
