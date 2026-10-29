@@ -705,12 +705,9 @@ def grpo_loss_fn(
     # PPO's computation but the actual loss is REINFORCE+SC — they are logged
     # for observability but should not be interpreted as the training signal.
     sc_loss_overridden = False
-    # loss_mode: a scalar string metric for dashboards to identify the actual
-    # loss path used.  "ppo" = PPO clipped surrogate (SC off, no baseline);
-    # "reinforce_sc" = REINFORCE + SC (Plan A, SC on); "reinforce_baseline" =
-    # pure REINFORCE (SC off, sc_reinforce_baseline=True); "ppo_sc" = PPO +
-    # SC additive (Plan B, SC on).  PPO stat fields (clip_ratio, etc.) are
-    # only meaningful when loss_mode starts with "ppo".
+    # Identify the loss path internally, then encode it numerically for the
+    # stats tracker. PPO clipping and importance-weight statistics describe
+    # the active objective for the "ppo" and "ppo_sc" paths.
     loss_mode = "ppo"
     if use_score_centering:
         sampler_topk_logps = input_data.get("sampler_topk_logps")
@@ -934,10 +931,15 @@ def grpo_loss_fn(
         dual_clip_ratio=stat["dual_clip_mask"].float(),
         denominator="n_valid_tokens",
     )
-    # loss_mode: scalar string identifying the actual loss path.  PPO stat
-    # fields (clip_ratio, importance_weight, etc.) are only meaningful when
-    # loss_mode starts with "ppo"; dashboards should annotate accordingly.
-    stats_tracker.scalar(loss_mode=loss_mode)
+    # The scalar tracker accepts numbers only. Dashboard loss-mode codes:
+    # 0 = PPO, 1 = REINFORCE + SC, 2 = REINFORCE baseline, 3 = PPO + SC.
+    loss_mode_codes = {
+        "ppo": 0,
+        "reinforce_sc": 1,
+        "reinforce_baseline": 2,
+        "ppo_sc": 3,
+    }
+    stats_tracker.scalar(loss_mode=loss_mode_codes[loss_mode])
     # sc_active: 1 if SC correction was applied this step, 0 otherwise.
     # Alert if use_score_centering=True but sc_active=0 persists — SC was
     # skipped (data missing → RuntimeError raised, so this should never be 0
