@@ -1,181 +1,252 @@
-name: Test Package Installation
+name: Upstream Ascend CPU CI (PR 1797)
 
 on:
   pull_request:
-    branches: [main]
-    paths:
-      - 'pyproject.toml'
-      - 'pyproject.vllm.toml'
-      - 'uv.lock'
-      - 'uv.vllm.lock'
-      - 'areal/**'
-      - '.github/workflows/install-test.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'pyproject.toml'
-      - 'pyproject.vllm.toml'
-      - 'uv.lock'
-      - 'uv.vllm.lock'
-      - 'areal/**'
-      - '.github/workflows/install-test.yml'
+    branches:
+      - ascend
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: install-test-${{ github.ref }}
+  group: ascend-pr-tests-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  install-test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ['3.12']
-    runs-on: ${{ matrix.os }}
-    name: Install test (${{ matrix.os }}, Python ${{ matrix.python-version }})
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-          cache-dependency-glob: |
-            uv.lock
-            uv.vllm.lock
-
-      - name: Set up Python
-        run: uv python install ${{ matrix.python-version }}
-
-      - name: Install package (basic)
-        run: uv sync
-
-      - name: Verify package import
-        run: |
-          uv run python -c "import areal; print(f'areal version: {areal.__version__}')"
-
-      - name: Verify core modules are importable
-        run: |
-          uv run python -c "
-          from areal import (
-              TrainController,
-              RolloutController,
-              WorkflowExecutor,
-              StalenessManager,
-              workflow_context,
-              current_platform,
-          )
-          print('All core modules imported successfully')
-          "
-
-      - name: Build wheel
-        run: uv build --wheel
-
-      - name: Verify wheel artifact
-        run: |
-          ls -la dist/
-          python -m zipfile -l dist/*.whl | head -20
-
-  install-test-cuda-extras:
-    # Test CUDA extras installation on Linux only (CUDA packages have Linux-only wheels)
-    # Note: flash-attn is excluded because it requires CUDA compilation infrastructure
-    # which is not available on standard GitHub runners
-    # sglang and vllm are conflicting extras, so we test each separately
+  pre-commit:
+    name: pre-commit
+    if: github.repository == 'Aression/AReaL'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [sglang, vllm]
-    name: Install test (Linux, CUDA extras, ${{ matrix.variant }})
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          repository: areal-project/AReaL
+          ref: dc4b62cf55399d34db053b9c28e7ab01ba1ead77
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
+          version: "0.9.18"
+          python-version: "3.11"
           enable-cache: true
-          cache-dependency-glob: |
-            uv.lock
-            uv.vllm.lock
+          cache-dependency-glob: uv.lock
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install 3.11
 
-      - name: Install package with CUDA extras (excluding flash-attn)
-        # flash-attn requires CUDA toolkit for compilation, skip it in CI
-        # Test individual extras that have pre-built wheels
+      - name: Install development environment
+        run: uv sync --frozen --group dev
+
+      - name: Run pre-commit
+        run: uv run pre-commit run --all-files
+
+  cpu-unit-tests:
+    name: cpu-unit-tests
+    if: github.repository == 'Aression/AReaL'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      AREAL_IS_IN_CI: "1"
+      CPU_TEST_BASE_SHA: ""
+      HF_HOME: "${{ github.workspace }}/.cache/huggingface"
+      HF_HUB_DISABLE_XET: "1"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      NO_PROXY: "127.0.0.1,localhost"
+      UV_HTTP_RETRIES: "5"
+      UV_HTTP_TIMEOUT: "300"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          repository: areal-project/AReaL
+          ref: dc4b62cf55399d34db053b9c28e7ab01ba1ead77
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.18"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          save-cache: false
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install CPU test environment
+        run: uv sync --frozen --group dev
+
+      - name: Verify CPU-only environment
         run: |
-          if [ "${{ matrix.variant }}" = "vllm" ]; then
-            cp pyproject.vllm.toml pyproject.toml
-            cp uv.vllm.lock uv.lock
-          fi
-          uv sync --extra ${{ matrix.variant }} --extra megatron --extra tms
+          uv run python - <<'PY'
+          import torch
 
-      - name: Verify package import with CUDA extras
-        run: |
-          uv run python -c "import areal; print(f'areal version: {areal.__version__}')"
+          print("torch:", torch.__version__)
+          print("CUDA available:", torch.cuda.is_available())
+          assert not torch.cuda.is_available()
+          PY
 
-      - name: Verify CUDA-dependent packages are installed
+      - name: Pre-download slow-test artifacts
         env:
-          VARIANT: ${{ matrix.variant }}
+          HF_HUB_OFFLINE: "0"
+          TRANSFORMERS_OFFLINE: "0"
+          HF_DATASETS_OFFLINE: "0"
         run: |
-          uv run python -c "
-          import os, importlib.util
-          variant = os.environ['VARIANT']
-          packages = [variant, 'megatron.core']
-          for pkg in packages:
-              spec = importlib.util.find_spec(pkg)
-              status = 'installed' if spec else 'not found'
-              print(f'{pkg}: {status}')
-          "
+          set -euo pipefail
 
-  install-test-docker:
-    # Test editable installation in Docker runtime image
-    # This mirrors the installation method documented for Docker users
-    # Only runs on manual dispatch due to large image pull time
-    # and `no space on device left` errors on busy runners
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [sglang, vllm]
-    name: Install test (Docker ${{ matrix.variant }} image)
-    container:
-      image: ghcr.io/areal-project/areal-runtime:dev-${{ matrix.variant }}
+          uv run hf --version
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+          download_with_retry() {
+            local attempt
+            local delay
 
-      - name: Install package (editable, no deps)
-        # This is the documented Docker installation method
-        # Dependencies are pre-installed in the runtime image
-        run: uv pip install -e . --no-deps
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
 
-      - name: Verify package import
+              if [[ "${attempt}" -lt 5 ]]; then
+                delay=$((attempt * 30))
+                echo "Download attempt ${attempt} failed; retrying in ${delay}s"
+                sleep "${delay}"
+              fi
+            done
+
+            echo "Download failed after 5 attempts"
+            return 1
+          }
+
+          download_with_retry \
+            uv run hf download \
+            openai/gsm8k \
+            --repo-type dataset \
+            --max-workers 4
+
+          download_with_retry \
+            uv run hf download \
+            hiyouga/geometry3k \
+            --repo-type dataset \
+            --max-workers 4
+
+          download_with_retry \
+            uv run hf download \
+            Qwen/Qwen3-0.6B \
+            --exclude "*.safetensors" \
+            --max-workers 4
+
+          download_with_retry \
+            uv run hf download \
+            Qwen/Qwen2.5-VL-3B-Instruct \
+            --exclude "*.safetensors" \
+            --max-workers 4
+
+      - name: Collect base CPU tests
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          AREAL_TEST_REPORT_DIR: /tmp/base-cpu-test-reports
+          CPU_TEST_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
-          python -c "import areal; print(f'areal version: {areal.__version__}')"
+          set -euo pipefail
 
-      - name: Verify core modules are importable
+          if [[ -z "${CPU_TEST_BASE_SHA}" || "${CPU_TEST_BASE_SHA}" =~ ^0+$ ]] || \
+            ! git cat-file -e "${CPU_TEST_BASE_SHA}^{tree}" 2>/dev/null; then
+            if [[ "${GITHUB_EVENT_NAME}" == "push" ]] && \
+              fallback_base_sha="$(git rev-parse --verify HEAD^ 2>/dev/null)"; then
+              echo "Base commit ${CPU_TEST_BASE_SHA:-<none>} is unavailable; comparing with ${fallback_base_sha}"
+              CPU_TEST_BASE_SHA="${fallback_base_sha}"
+            else
+              echo "No reachable base commit is available; skipping the comparison"
+              exit 0
+            fi
+          fi
+          echo "CPU_TEST_BASE_SHA=${CPU_TEST_BASE_SHA}" >> "${GITHUB_ENV}"
+
+          base_dir="$(mktemp -d)"
+          plugin_dir="$(mktemp -d)"
+          cleanup() {
+            rm -rf -- "${base_dir}" "${plugin_dir}"
+          }
+          trap cleanup EXIT
+
+          cp scripts/ci_test_report.py "${plugin_dir}/ci_test_report.py"
+          if ! git archive "${CPU_TEST_BASE_SHA}" | tar -x -C "${base_dir}"; then
+            echo "::warning title=Base CPU comparison unavailable::Could not extract ${CPU_TEST_BASE_SHA}"
+            rm -rf -- /tmp/base-cpu-test-reports
+            exit 0
+          fi
+
+          if ! (
+            cd "${base_dir}"
+            "${GITHUB_WORKSPACE}/.venv/bin/python" scripts/select_cpu_tests.py \
+              --ignore tests/experimental/archon \
+              > /tmp/base-cpu-test-files.txt
+            mapfile -t base_cpu_test_files < /tmp/base-cpu-test-files.txt
+            test "${#base_cpu_test_files[@]}" -gt 0
+            PYTHONPATH="${plugin_dir}:${base_dir}" \
+              "${GITHUB_WORKSPACE}/.venv/bin/python" -m pytest -q \
+              --collect-only \
+              -p ci_test_report \
+              -m "not npu and not multi_npu and not cuda and not nccl and not sglang and not vllm and not integration" \
+              "${base_cpu_test_files[@]}"
+          ) > /tmp/base-cpu-collection.log 2>&1; then
+            cat /tmp/base-cpu-collection.log
+            echo "::warning title=Base CPU comparison unavailable::Base test collection failed"
+            rm -rf -- /tmp/base-cpu-test-reports
+            exit 0
+          fi
+
+      - name: Run CPU unit tests
+        env:
+          AREAL_TEST_REPORT_DIR: /tmp/current-cpu-test-reports
         run: |
-          python -c "
-          from areal import (
-              TrainController,
-              RolloutController,
-              WorkflowExecutor,
-              StalenessManager,
-              workflow_context,
-              current_platform,
+          set -euo pipefail
+
+          uv run python scripts/select_cpu_tests.py \
+            --ignore tests/experimental/archon \
+            > /tmp/cpu-test-files.txt
+          mapfile -t cpu_test_files < /tmp/cpu-test-files.txt
+          test "${#cpu_test_files[@]}" -gt 0
+          printf 'Selected %s CPU test modules\n' "${#cpu_test_files[@]}"
+          uv run pytest -q \
+            -p scripts.ci_test_report \
+            -m "not npu and not multi_npu and not cuda and not nccl and not sglang and not vllm and not integration" \
+            "${cpu_test_files[@]}"
+
+      - name: Report CPU test counts
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d /tmp/current-cpu-test-reports ]]; then
+            echo "CPU test report was not produced"
+            exit 0
+          fi
+
+          report_args=(
+            --current /tmp/current-cpu-test-reports
+            --suite CPU
+            --step-summary "${GITHUB_STEP_SUMMARY}"
           )
-          print('All core modules imported successfully')
-          "
-
-      - name: Run Docker installation validation
-        run: |
-          python areal/tools/validate_docker_installation.py
+          if [[ -d /tmp/base-cpu-test-reports ]]; then
+            git diff --name-only "${CPU_TEST_BASE_SHA}" HEAD -- tests \
+              > /tmp/changed-cpu-test-files.txt
+            report_args+=(
+              --base /tmp/base-cpu-test-reports
+              --base-sha "${CPU_TEST_BASE_SHA}"
+              --changed-test-files /tmp/changed-cpu-test-files.txt
+            )
+          fi
+          uv run python scripts/ci_test_report.py summarize "${report_args[@]}"
