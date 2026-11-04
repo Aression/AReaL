@@ -1,39 +1,20 @@
 # Score Centering 在 ascend 新基线上的重实现记录
 
-> 本文档记录 `exp/score_centering_megatron_fsdp` 分支的由来、rebase 过程中的冲突与 处理方式，以及需要在内网 Megatron
-> 环境完成的待验证项目。
+> **状态：已被 v4 取代，其中 Megatron 部分转为后续工作**
+>
+> 本轮为最快推进合入，改由 [`docs/immgration/v4`](../v4/README.md) 承担：在 `ascend` 新 HEAD `ce444f9f`
+> 上重放，并先在内网修复 tis/mis 与多轮推理。 本文档保留 rebase 过程的原始记录；第 7 节的 Megatron 后端待验证项不作为 本轮合入的前置条件。
 
-______________________________________________________________________
-
-## 1. 前因：PR #1797 与新基线分叉
-
-PR #1797（`Aression/AReaL:feature/score-centering` → `areal-project/AReaL:ascend`）最初 基于
-`ascend` commit `abe0fb0a`，随后 `ascend` 前进到 `5c633b70`。当时 CI 全绿：
-
-- pre-commit：通过
-- 上游完整 CPU 套件：3739 passed / 12 skipped
-- 上游 NPU 套件：137/137 passed
-
-之后 `ascend` 继续前进到 `ce444f9f`（含 22 个新提交），PR 状态变为
-`mergeable_state = dirty`，`rebaseable = false`，即无法直接合并。
-
-为不阻塞后续实验，另起 `exp/score_centering_megatron_fsdp` 分支，在 **当前 `ascend` HEAD（`ce444f9f`）**
-上重新实现同一份改动，而不是在旧基线上继续解冲突。
-
-______________________________________________________________________
-
-## 2. 新基线带来的变化
-
-从 `abe0fb0a` / `5c633b70` 到 `ce444f9f`，与本特性相关的上游改动：
-
-| 上游提交                                                     | 影响                                                                                                 |
-| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| `77d57cfc` feat(trainer): MiMo-inspired RL metrics (#1736)   | 引入 `stat_compact` / `ReduceType` 紧凑统计；把版本陈旧度日志从 `grpo_loss_fn` 移到 `_ppo_update`    |
-| `20bb2db8` feat(trainer): separate importance-sampling stage | `ppo_actor_loss_fn` 新增独立 `importance_sampling` 修正阶段                                          |
-| `42ac71b3` / `6a924588`                                      | CP-safe vocab 统计、`vocab_mean_logits` / `vocab_norm_logits` 指标；CP 只聚合标量而非全 vocab logits |
-| `1801143e` / `f40f1f24` / `5e981ad4`                         | NPU chunked-logprobs、fp32 LM head、`logprobs_chunk_size` 配置                                       |
-| `8d86a2b1` perf(trainer): critic-free GAE fast path          | GRPO 无 critic 时用 cumsum 计算 reward-to-go                                                         |
-| `cc2b8ad7` 等                                                | Qwen3.5 加入 `attention_mask = None` 分支                                                            |
+\------------------------------------------------------------ |
+\----------------------------------------------------------------------------------------------------
+| | `77d57cfc` feat(trainer): MiMo-inspired RL metrics (#1736) | 引入 `stat_compact` /
+`ReduceType` 紧凑统计；把版本陈旧度日志从 `grpo_loss_fn` 移到 `_ppo_update` | | `20bb2db8`
+feat(trainer): separate importance-sampling stage | `ppo_actor_loss_fn` 新增独立
+`importance_sampling` 修正阶段 | | `42ac71b3` / `6a924588` | CP-safe vocab
+统计、`vocab_mean_logits` / `vocab_norm_logits` 指标；CP 只聚合标量而非全 vocab logits | | `1801143e`
+/ `f40f1f24` / `5e981ad4` | NPU chunked-logprobs、fp32 LM head、`logprobs_chunk_size` 配置 |
+| `8d86a2b1` perf(trainer): critic-free GAE fast path | GRPO 无 critic 时用 cumsum 计算
+reward-to-go | | `cc2b8ad7` 等 | Qwen3.5 加入 `attention_mask = None` 分支 |
 
 ______________________________________________________________________
 
