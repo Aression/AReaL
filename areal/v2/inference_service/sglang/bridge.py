@@ -13,6 +13,7 @@ from areal.api.io_struct import (
     HttpRequest,
     get_versioned_lora_name,
 )
+from areal.utils.sglang_image import image_request_kwargs
 
 if TYPE_CHECKING:
     from areal.api.io_struct import ModelRequest
@@ -63,7 +64,7 @@ class SGLangBridgeBackend:
             sampling_params["sampling_seed"] = gconfig.seed
 
         payload: dict[str, Any] = {
-            "input_ids": list(req.input_ids),
+            **image_request_kwargs(req),
             "image_data": req.image_data,
             "sampling_params": sampling_params,
             "return_logprob": True,
@@ -91,8 +92,6 @@ class SGLangBridgeBackend:
         response: dict[str, Any],
     ) -> HttpGenerationResult:
         """Parse SGLang ``/generate`` JSON into :class:`HttpGenerationResult`."""
-        import pybase64
-
         meta_info = response["meta_info"]
         finish_reason = meta_info["finish_reason"]
         stop_reason: str = finish_reason["type"]
@@ -102,13 +101,14 @@ class SGLangBridgeBackend:
         routed_experts: np.ndarray | None = None
         raw_experts = meta_info.get("routed_experts", None)
         if raw_experts is not None:
-            num_sgl_token = (
-                meta_info["prompt_tokens"] + meta_info["completion_tokens"] - 1
+            from areal.engine.r3.preprocess import decode_sglang_routed_experts
+
+            routed_experts = decode_sglang_routed_experts(
+                raw_experts,
+                prompt_tokens=meta_info["prompt_tokens"],
+                completion_tokens=meta_info["completion_tokens"],
+                source="v2 SGLangBridge",
             )
-            routed_experts = np.frombuffer(
-                pybase64.b64decode(raw_experts.encode("utf-8")),
-                dtype=np.int32,
-            ).reshape(num_sgl_token, -1)
 
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(
@@ -166,5 +166,6 @@ class SGLangBridgeBackend:
         accumulated_tokens: list[int],
         remaining_tokens: int,
     ) -> None:
-        http_req.payload["input_ids"] = list(req.input_ids) + accumulated_tokens
+        http_req.payload.pop("mm_sampling_kwargs", None)
+        http_req.payload.update(image_request_kwargs(req, accumulated_tokens))
         http_req.payload["sampling_params"]["max_new_tokens"] = remaining_tokens

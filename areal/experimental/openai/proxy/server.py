@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from areal.experimental.openai.cache import InteractionCache
+from areal.experimental.openai.finalization import finalize_interactions
 
 if TYPE_CHECKING:
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
@@ -229,13 +230,20 @@ class SessionData:
         return True
 
     def export_interactions(
-        self, discount: float, style: str, drop_retry_orphans: bool = False
+        self,
+        discount: float,
+        style: str,
+        drop_retry_orphans: bool = False,
+        *,
+        episode_reward: float | None = None,
     ) -> dict[str, InteractionWithTokenLogpReward]:
         if len(self.completions) == 0:
             return {}
-        interactions = self.completions.export_interactions(
+        interactions = finalize_interactions(
+            self.completions,
             style=style,
             reward_discount=discount,
+            episode_reward=episode_reward,
             drop_retry_orphans=drop_retry_orphans,
         )
         for interaction in interactions.values():
@@ -252,9 +260,19 @@ class SessionData:
 def serialize_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
     tensor_store: GroupTensorStore | None = None,
+    *,
+    r3_num_moe_layers: int | None = None,
+    r3_topk: int | None = None,
 ) -> dict[str, Any]:
     """Serialize interactions into a json-compatible format for HTTP transport."""
+    from areal.experimental.openai.types import configure_r3_interactions
     from areal.infra.rpc.serialization import serialize_value
+
+    configure_r3_interactions(
+        interactions,
+        num_moe_layers=r3_num_moe_layers,
+        topk=r3_topk,
+    )
 
     result = {}
     for key, interaction in interactions.items():

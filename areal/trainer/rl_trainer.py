@@ -37,6 +37,8 @@ from areal.api.cli_args import (
 )
 from areal.dataset.mopd import RoutedDataset, is_remote_dataset
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
+from areal.engine.r3.config import R3MoEConfig, resolve_r3_moe_config
+from areal.engine.r3.transport import without_r3_tensors
 from areal.infra import (
     LocalScheduler,
     RayScheduler,
@@ -225,6 +227,7 @@ class PPOTrainer:
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
 
         self.config = config
+        self._r3_moe_config: R3MoEConfig | None = None
         self.mopd_execution_plan = MOPDExecutionPlan.from_config(config)
         self._apply_dte_config_envvars()
         self.processor, self.tokenizer = load_hf_processor_and_tokenizer(
@@ -725,19 +728,25 @@ class PPOTrainer:
         epoch: int,
         epoch_step: int,
         global_step: int,
+        actor_stats_before_exchange: dict[str, float] | None = None,
         prepared_stats: dict[str, Any] | None = None,
     ) -> None:
         """Commit prepared evaluation stats, or export then restore AWEX KV."""
         if prepared_stats is not None:
+            stats = dict(actor_stats_before_exchange or {})
+            stats.update(prepared_stats)
             if self.eval_rollout is not None:
-                prepared_stats.update(self.eval_rollout.export_stats())
+                stats.update(self.eval_rollout.export_stats())
             # Eval and clear-batch timings were recorded after the early actor
             # export. Drain only local CPU statistics, not another GPU RPC.
-            prepared_stats.update(stats_tracker.export_all())
-            self._commit_stats(epoch, epoch_step, global_step, prepared_stats)
+            stats.update(stats_tracker.export_all())
+            self._commit_stats(epoch, epoch_step, global_step, stats)
             return
         self._export_and_commit_stats(
-            epoch=epoch, epoch_step=epoch_step, global_step=global_step
+            epoch=epoch,
+            epoch_step=epoch_step,
+            global_step=global_step,
+            actor_stats_before_exchange=actor_stats_before_exchange,
         )
         if self.eval_rollout is None:
             self._restore_awex_rollout_after_stats()
@@ -886,6 +895,12 @@ class PPOTrainer:
             raise ValueError(f"Total epochs must be positive: {total_epochs}")
         steps_per_epoch = len(self.train_dataloader)
         max_steps = total_epochs * steps_per_epoch
+        workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
+            workflow, workflow_kwargs
+        )
+        eval_workflow_kwargs = self._maybe_inject_r3_workflow_kwargs(
+            eval_workflow, eval_workflow_kwargs
+        )
 
         # Initialize proxy workers if not using RolloutWorkflow
         if workflow is None:
@@ -982,7 +997,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    values = self.critic.compute_values(rollout_batch)
+                    values = self.critic.compute_values(
+                        [without_r3_tensors(traj) for traj in rollout_batch]
+                    )
                     for traj, v in zip(rollout_batch, values):
                         traj["values"] = v
                     self.critic.get_device_stats().log("critic values")
@@ -999,7 +1016,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    ref_logps = self.ref.compute_logp(rollout_batch)
+                    ref_logps = self.ref.compute_logp(
+                        [without_r3_tensors(traj) for traj in rollout_batch]
+                    )
                     for traj, logp in zip(rollout_batch, ref_logps):
                         traj["ref_logp"] = logp
                     self.ref.get_device_stats().log("ref logp")
@@ -1017,7 +1036,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    teacher_logps = self.teacher.compute_logp(rollout_batch)
+                    teacher_logps = self.teacher.compute_logp(
+                        [without_r3_tensors(traj) for traj in rollout_batch]
+                    )
                     for traj, logp in zip(rollout_batch, teacher_logps):
                         traj["teacher_logp"] = logp
                         traj["rl_loss_weight"] = self.config.teacher.rl_loss_weight
@@ -1131,7 +1152,12 @@ class PPOTrainer:
                     args={"global_step": global_step},
                 ),
             ):
-                self.actor.ppo_update(adv_batch)
+                update_kwargs = (
+                    {"max_head_offpolicyness": config.rollout.max_head_offpolicyness}
+                    if config.rollout.mask_stale_tokens
+                    else {}
+                )
+                self.actor.ppo_update(adv_batch, **update_kwargs)
                 self.actor.step_lr_scheduler()
                 self.actor.get_device_stats().log("ppo update")
 
@@ -1156,7 +1182,9 @@ class PPOTrainer:
                         args={"global_step": global_step},
                     ),
                 ):
-                    self.critic.ppo_update(adv_batch)
+                    self.critic.ppo_update(
+                        [without_r3_tensors(traj) for traj in adv_batch]
+                    )
                     self.critic.step_lr_scheduler()
                     self.critic.get_device_stats().log("ppo critic update")
                 if self._should_offload_critic:
@@ -1177,6 +1205,17 @@ class PPOTrainer:
                     epoch_step=step,
                     global_step=global_step,
                 )
+
+            # Actor statistics contain detached per-token CUDA clones until
+            # export(reset=True).  In AWEX colocation those clones otherwise
+            # survive through weight exchange and overlap SGLang's resumed
+            # weights by several GiB.  Aggregate them to Python scalars before
+            # the ownership handoff, then carry the scalars to the normal
+            # end-of-step commit point.  A post-exchange export still collects
+            # controller/update timing recorded after this boundary.
+            actor_stats_before_exchange = None
+            if self._is_v1_awex_colocate(config):
+                actor_stats_before_exchange = self.actor.export_stats()
 
             # pause inference for updating weights, save, and evaluation
             self.rollout.pause()
@@ -1243,6 +1282,13 @@ class PPOTrainer:
                         cleanups.append(
                             ("ref", lambda: self.ref.clear_batches(rollout_batch))
                         )
+                    if self.teacher is not None:
+                        cleanups.append(
+                            (
+                                "teacher",
+                                lambda: self.teacher.clear_batches(rollout_batch),
+                            )
+                        )
                     if self.data_controller is not None:
                         cleanups.append(
                             ("data", lambda: self.data_controller.clear_batches())
@@ -1281,6 +1327,7 @@ class PPOTrainer:
                     epoch=epoch,
                     epoch_step=step,
                     global_step=global_step,
+                    actor_stats_before_exchange=actor_stats_before_exchange,
                     prepared_stats=prepared_stats,
                 )
 
@@ -1619,6 +1666,7 @@ class PPOTrainer:
         if rollout_backend == "sglang":
             if self.config.rollout.return_routed_experts:
                 self.config.sglang.enable_return_routed_experts = True
+                self.config.actor.megatron.enable_router_replay = True
             if lora_path is not None and self.config.actor.use_lora:
                 self.config.sglang.lora_paths = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
@@ -1685,6 +1733,10 @@ class PPOTrainer:
             role="rollout",
             server_args=server_args,
         )
+        if config._version == "v2" and self.config.rollout.return_routed_experts:
+            r3_config = self._resolve_actor_r3_moe_config()
+            init_kwargs["r3_num_moe_layers"] = r3_config.num_moe_layers
+            init_kwargs["r3_topk"] = r3_config.topk
         if is_eval:
             assert len(self.rollout.server_infos) > 0
             init_kwargs["server_infos"] = self.rollout.server_infos
@@ -1923,9 +1975,16 @@ class PPOTrainer:
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
 
-    def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+    def _export_and_commit_stats(
+        self,
+        epoch: int,
+        epoch_step: int,
+        global_step: int,
+        actor_stats_before_exchange: dict[str, float] | None = None,
+    ):
         # Upload statistics to the logger (e.g., wandb)
-        stats = self.actor.export_stats()
+        stats = dict(actor_stats_before_exchange or {})
+        stats.update(self.actor.export_stats())
         stats.update(self.rollout.export_stats())
         if self.eval_rollout is not None:
             stats.update(self.eval_rollout.export_stats())
@@ -1939,6 +1998,102 @@ class PPOTrainer:
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
+
+    def _validate_weight_update_model(self) -> None:
+        """Reject Qwen2/Qwen2.5 text models on the Megatron AWEX path."""
+        actor = self.config.actor
+        # Controller v2 selects disk for LoRA and AWEX otherwise, regardless
+        # of weight_update_mode. FSDP uses HF parameter layout and bypasses
+        # the Megatron model converter. Controller v1 dispatches on the field.
+        if actor._version == "v2" and (
+            actor.use_lora or self.actor_alloc.backend != "megatron"
+        ):
+            return
+        if actor._version == "v1" and actor.weight_update_mode in ("disk", "xccl"):
+            return
+
+        from transformers import PretrainedConfig
+
+        # Read the checkpoint metadata, not its directory/repository name. Qwen2.5
+        # text models also identify as Qwen2ForCausalLM, unlike Qwen2.5-VL.
+        model_config, _ = PretrainedConfig.get_config_dict(actor.path)
+        if model_config.get("model_type") == "qwen2" or "Qwen2ForCausalLM" in (
+            model_config.get("architectures") or []
+        ):
+            raise ValueError(
+                "Qwen2/Qwen2.5 text models do not support Megatron AWEX weight updates. "
+                "For v1, set actor.weight_update_mode=disk or xccl. "
+                "For v2, set actor.use_lora=True to select disk adapter updates."
+            )
+
+    def _resolve_actor_r3_moe_config(self) -> R3MoEConfig:
+        if self._r3_moe_config is None:
+            from transformers import AutoConfig
+
+            hf_config = AutoConfig.from_pretrained(
+                self.config.actor.path,
+                trust_remote_code=True,
+            )
+            self._r3_moe_config = resolve_r3_moe_config(hf_config)
+        return self._r3_moe_config
+
+    def _supports_r3_workflow_shape(self, workflow: WorkflowLike | None) -> bool:
+        if workflow is None:
+            return False
+        if self._is_unsupported_r3_vision_workflow(workflow):
+            return False
+        if isinstance(workflow, str):
+            return workflow in {
+                "areal.workflow.rlvr.RLVRWorkflow",
+                "areal.experimental.openai.proxy.workflow.OpenAIProxyWorkflow",
+            }
+
+        from areal.experimental.openai.proxy.workflow import OpenAIProxyWorkflow
+        from areal.workflow.rlvr import RLVRWorkflow
+
+        supported_types = (RLVRWorkflow, OpenAIProxyWorkflow)
+        if isinstance(workflow, type):
+            return issubclass(workflow, supported_types)
+        return isinstance(workflow, supported_types)
+
+    def _is_unsupported_r3_vision_workflow(self, workflow: WorkflowLike | None) -> bool:
+        if isinstance(workflow, str):
+            return workflow == "areal.workflow.vision_rlvr.VisionRLVRWorkflow"
+        if workflow is None:
+            return False
+
+        from areal.workflow.vision_rlvr import VisionRLVRWorkflow
+
+        if isinstance(workflow, type):
+            return issubclass(workflow, VisionRLVRWorkflow)
+        return isinstance(workflow, VisionRLVRWorkflow)
+
+    def _maybe_inject_r3_workflow_kwargs(
+        self,
+        workflow: WorkflowLike | None,
+        workflow_kwargs: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not self.config.rollout.return_routed_experts:
+            return workflow_kwargs
+        if self._is_unsupported_r3_vision_workflow(workflow):
+            raise ValueError(
+                "return_routed_experts/R3 router replay currently supports packed "
+                "text RLVR and OpenAI proxy workflows only; VisionRLVRWorkflow is "
+                "not supported."
+            )
+        if not self._supports_r3_workflow_shape(workflow):
+            return workflow_kwargs
+
+        r3_config = self._resolve_actor_r3_moe_config()
+        if not isinstance(workflow, (str, type)):
+            setattr(workflow, "r3_num_moe_layers", r3_config.num_moe_layers)
+            setattr(workflow, "r3_topk", r3_config.topk)
+            return workflow_kwargs
+
+        updated = dict(workflow_kwargs or {})
+        updated.setdefault("r3_num_moe_layers", r3_config.num_moe_layers)
+        updated.setdefault("r3_topk", r3_config.topk)
+        return updated
 
     def _validate_cfg(self):
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
@@ -1986,6 +2141,11 @@ class PPOTrainer:
                 "return_routed_experts is only supported with SGLang backend. "
                 "Please disable return_routed_experts or switch to SGLang backend."
             )
+        if self.config.rollout.return_routed_experts and actor_backend != "megatron":
+            raise ValueError(
+                "return_routed_experts requires actor.backend='megatron' because "
+                "R3 training replay is only supported by Megatron actors."
+            )
         if (
             actor_backend == "megatron"
             and self.config.actor.use_lora
@@ -2005,6 +2165,7 @@ class PPOTrainer:
                 f"actor._version ('{actor_version}') and rollout._version "
                 f"('{rollout_version}') must match. Both must be 'v1' or both 'v2'."
             )
+        self._validate_weight_update_model()
         if self.config.mopd is not None:
             requires_teacher_scoring = (
                 self.mopd_execution_plan is not None

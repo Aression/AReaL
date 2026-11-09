@@ -1,6 +1,7 @@
 """Tests for Megatron-Bridge deterministic provider configuration."""
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -15,6 +16,10 @@ class _FinalizeReached(RuntimeError):
 
 class _FakeProvider(SimpleNamespace):
     def finalize(self) -> None:
+        self.vision_flags_at_finalize = {
+            name: getattr(self, name, None)
+            for name in ("freeze_vision_model", "freeze_vision_projection")
+        }
         self.config_at_finalize = (
             self.deterministic_mode,
             self.attention_backend,
@@ -63,6 +68,7 @@ def _make_provider(attention_backend) -> _FakeProvider:
         cross_entropy_loss_fusion=True,
         bias_dropout_fusion=True,
         mtp_num_layers=None,
+        gradient_accumulation_fusion=False,
     )
 
 
@@ -70,6 +76,9 @@ def _run_until_provider_finalize(
     provider: _FakeProvider,
     *,
     deterministic: bool,
+    freeze_vision_model: bool | None = None,
+    freeze_vision_projection: bool | None = None,
+    model_type: str | None = None,
 ) -> None:
     pytest.importorskip("mbridge")
     pytest.importorskip("megatron.core")
@@ -77,6 +86,8 @@ def _run_until_provider_finalize(
 
     tf_config = SimpleNamespace(params_dtype=None)
     mcore_config = _make_mcore_config(deterministic=deterministic)
+    mcore_config.freeze_vision_model = freeze_vision_model
+    mcore_config.freeze_vision_projection = freeze_vision_projection
 
     with (
         mock.patch.multiple(
@@ -92,12 +103,77 @@ def _run_until_provider_finalize(
         for getter in mpu_mocks.values():
             getter.return_value = 1
         make_mcore_model(
-            hf_config=SimpleNamespace(),
+            hf_config=SimpleNamespace(model_type=model_type),
             tf_config=tf_config,
             mcore_config=mcore_config,
             bridge=_FakeBridge(provider),
             bridge_type="megatron-bridge",
         )
+
+
+@pytest.mark.parametrize("freeze_encoder", [False, True])
+@pytest.mark.parametrize("freeze_projection", [False, True])
+def test_megatron_bridge_vision_freezing_reaches_provider_before_finalize(
+    freeze_encoder, freeze_projection
+):
+    provider = _make_provider(attention_backend=object())
+    provider.freeze_vision_model = False
+    provider.freeze_vision_projection = False
+
+    _run_until_provider_finalize(
+        provider,
+        deterministic=False,
+        freeze_vision_model=freeze_encoder,
+        freeze_vision_projection=freeze_projection,
+    )
+
+    assert provider.vision_flags_at_finalize == {
+        "freeze_vision_model": freeze_encoder,
+        "freeze_vision_projection": freeze_projection,
+    }
+
+
+def test_megatron_bridge_default_does_not_unfreeze_provider():
+    provider = _make_provider(attention_backend=object())
+    provider.freeze_vision_model = True
+    provider.freeze_vision_projection = True
+
+    _run_until_provider_finalize(provider, deterministic=False)
+
+    assert all(provider.vision_flags_at_finalize.values())
+
+
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
+)
+def test_megatron_bridge_qwen_vision_is_frozen_by_default(model_type):
+    provider = _make_provider(attention_backend=object())
+    provider.freeze_vision_model = False
+    provider.freeze_vision_projection = False
+    _run_until_provider_finalize(provider, deterministic=False, model_type=model_type)
+    assert all(provider.vision_flags_at_finalize.values())
+
+
+def test_megatron_bridge_qwen_vision_can_be_explicitly_unfrozen():
+    provider = _make_provider(attention_backend=object())
+    provider.freeze_vision_model = True
+    provider.freeze_vision_projection = True
+    _run_until_provider_finalize(
+        provider,
+        deterministic=False,
+        model_type="qwen3_5",
+        freeze_vision_model=False,
+        freeze_vision_projection=False,
+    )
+    assert not any(provider.vision_flags_at_finalize.values())
+
+
+@pytest.mark.parametrize("option", ["freeze_vision_model", "freeze_vision_projection"])
+def test_megatron_bridge_rejects_unsupported_vision_freezing(option):
+    provider = _make_provider(attention_backend=object())
+
+    with pytest.raises(ValueError, match=f"does not support {option}"):
+        _run_until_provider_finalize(provider, deterministic=False, **{option: True})
 
 
 def test_megatron_bridge_provider_applies_determinism_before_finalize():
@@ -115,8 +191,8 @@ def test_megatron_bridge_provider_applies_determinism_before_finalize():
     )
 
 
-def test_megatron_bridge_provider_preserves_defaults_when_disabled():
-    """The Megatron-Bridge provider remains unchanged without the opt-in."""
+def test_megatron_bridge_provider_applies_fusion_config_when_nondeterministic():
+    """The engine fusion setting still applies without deterministic mode."""
     attention_backend = object()
     provider = _make_provider(attention_backend)
 
@@ -127,6 +203,26 @@ def test_megatron_bridge_provider_preserves_defaults_when_disabled():
         attention_backend,
         True,
         True,
+    )
+
+
+@pytest.mark.parametrize("fusion_enabled", [False, True])
+@pytest.mark.parametrize("extension_available", [False, True])
+def test_megatron_bridge_fusion_requires_native_output_extension(
+    monkeypatch, fusion_enabled, extension_available
+):
+    """Provider fusion must support the native output head before construction."""
+    provider = _make_provider(attention_backend=object())
+    provider.gradient_accumulation_fusion = fusion_enabled
+    extension = (
+        ModuleType("fused_weight_gradient_mlp_cuda") if extension_available else None
+    )
+    monkeypatch.setitem(sys.modules, "fused_weight_gradient_mlp_cuda", extension)
+
+    _run_until_provider_finalize(provider, deterministic=False)
+
+    assert provider.gradient_accumulation_fusion == (
+        fusion_enabled and extension_available
     )
 
 

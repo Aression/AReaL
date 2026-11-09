@@ -69,6 +69,11 @@ def main():
         default="qwen",
     )
     parser.add_argument(
+        "--tool-call-parser-allow-recovery",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
         "--reasoning-parser",
         default="qwen3",
     )
@@ -81,6 +86,20 @@ def main():
         "--chat-template-type",
         default="hf",
         choices=("hf", "concat"),
+    )
+    parser.add_argument(
+        "--return-routed-experts",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--r3-num-moe-layers",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--r3-topk",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--message-preprocessor",
@@ -121,9 +140,13 @@ def main():
         deterministic_sampling=args.deterministic_sampling,
         serving_addr=format_hostport(serving_host, args.port),
         tool_call_parser=args.tool_call_parser,
+        tool_call_parser_allow_recovery=args.tool_call_parser_allow_recovery,
         reasoning_parser=args.reasoning_parser,
         engine_max_tokens=args.engine_max_tokens,
         chat_template_type=args.chat_template_type,
+        return_routed_experts=args.return_routed_experts,
+        r3_num_moe_layers=args.r3_num_moe_layers,
+        r3_topk=args.r3_topk,
         message_preprocessors=tuple(args.message_preprocessor),
         prefix_matcher=args.prefix_matcher,
         prm=TypeAdapter(PRMConfig).validate_json(args.prm_config),

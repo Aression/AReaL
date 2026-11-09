@@ -92,7 +92,7 @@ def test_flash_next_startup_patches_all_sources_and_repeated_start_is_write_free
     assert all(target.stat().st_mtime_ns == mtime for target, mtime in mtimes.items())
 
 
-@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_vl", "llama", None])
+@pytest.mark.parametrize("model_type", ["qwen2_vl", "llama", None])
 def test_other_model_types_skip_sglang_even_with_flash_next_directory_name(
     tmp_path, monkeypatch, model_type
 ):
@@ -142,6 +142,22 @@ def test_unknown_source_rejects_entire_profile_without_partial_modification(runt
 
     assert all(target.read_bytes() == source for target, source in before.items())
     assert not (root / ".areal-sglang-patches.lock").exists()
+
+
+@pytest.mark.parametrize("patch", [qsa, qwen, executor])
+def test_patch_cli_applies_fix_and_repeats_safely(runtime, monkeypatch, patch):
+    """Recipe commands use the guarded, idempotent engine patch entry points."""
+    root, _, sources = runtime
+    target = root / patch.TARGET_RELATIVE
+    monkeypatch.setattr(sys, "argv", [patch.__name__, "--target", str(target)])
+
+    patch.main()
+    assert target.read_bytes() == patch.patched_source(sources[patch])
+    mtime = target.stat().st_mtime_ns
+    patch.main()
+
+    assert target.stat().st_mtime_ns == mtime
+    assert target.read_bytes() == patch.patched_source(sources[patch])
 
 
 def test_concurrent_starts_install_each_source_once(runtime, monkeypatch):
@@ -288,7 +304,7 @@ def test_launcher_wraps_selected_entrypoint_and_keeps_child_environment(monkeypa
     command = [
         "inference-python",
         "-m",
-        "areal.engine.awex.sglang_plugin",
+        "areal.engine.awex.plugins.sglang_plugin",
         "--model-path",
         "model",
     ]

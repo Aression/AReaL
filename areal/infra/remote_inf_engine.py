@@ -180,6 +180,19 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         results = [result if result else None for result in completed_results]
         valid_results = [r for r in results if r is not None]
         usable_slot_count = len(valid_results)
+        failed_slot_count = self.group_size - usable_slot_count
+        is_incomplete = failed_slot_count > 0
+        if is_incomplete:
+            self.logger.warning(
+                "GroupedRolloutWorkflow: "
+                f"{failed_slot_count}/{self.group_size} trajectories are incomplete"
+            )
+        # Include complete groups in the denominator, rather than reporting
+        # a conditional mean over incomplete groups only.
+        stats_tracker.get(workflow_context.stat_scope()).scalar(
+            incomplete_trajectories=failed_slot_count,
+            incomplete_group=float(is_incomplete),
+        )
 
         interaction_group = not valid_results or all(
             isinstance(result, dict)
@@ -1100,8 +1113,10 @@ class RemoteInfEngine(InferenceEngine):
         start_time = time.perf_counter()
         accumulated_output_tokens = []
         accumulated_output_logprobs = []
+        accumulated_head_ids = []
+        accumulated_head_logprobs = []
         accumulated_versions = []
-        accumulated_routed_experts: list[np.ndarray] = []
+        final_routed_experts: np.ndarray | None = None
 
         # A single "rid" shares the same server to allow KV cache reuse
         if req.rid in self.rid_to_address:
@@ -1175,15 +1190,46 @@ class RemoteInfEngine(InferenceEngine):
                         "Please use a MoE model to get routed_experts information."
                     )
 
+            if gconfig.score_centering_top_k and gen_result.output_tokens:
+                from areal.utils.score_centering import validate_heads
+
+                validate_heads(
+                    gen_result.sampler_head_ids,
+                    gen_result.sampler_head_logprobs,
+                    len(gen_result.output_tokens),
+                    gconfig.score_centering_top_k,
+                )
+                accumulated_head_ids.extend(gen_result.sampler_head_ids)
+                accumulated_head_logprobs.extend(gen_result.sampler_head_logprobs)
+
             # Update accumulated outputs
             accumulated_output_tokens.extend(gen_result.output_tokens)
             accumulated_output_logprobs.extend(gen_result.output_logprobs)
             accumulated_versions.extend(
                 [request_version] * len(gen_result.output_tokens)
             )
-            # Accumulate routed_experts for MoE models
+            # Accumulate routed_experts for MoE models. SGLang returns routing
+            # for the full request prefix on abort/resubmit, so keep already
+            # accepted rows and append only the newly covered suffix.
             if gen_result.routed_experts is not None:
-                accumulated_routed_experts.append(gen_result.routed_experts)
+                if final_routed_experts is None:
+                    final_routed_experts = gen_result.routed_experts
+                else:
+                    consumed_rows = final_routed_experts.shape[0]
+                    if gen_result.routed_experts.shape[0] < consumed_rows:
+                        raise RuntimeError(
+                            "SGLang routed_experts for a resubmitted request is "
+                            "shorter than the previously accumulated routing rows: "
+                            f"new_shape={gen_result.routed_experts.shape}, "
+                            f"accumulated_shape={final_routed_experts.shape}."
+                        )
+                    final_routed_experts = np.concatenate(
+                        [
+                            final_routed_experts,
+                            gen_result.routed_experts[consumed_rows:],
+                        ],
+                        axis=0,
+                    )
 
             # Record speculative-decoding acceptance metrics from SGLang
             # meta_info. Recorded per generation segment (partial rollout may
@@ -1215,17 +1261,29 @@ class RemoteInfEngine(InferenceEngine):
 
         latency = time.perf_counter() - start_time
 
-        accumulated_routed_experts = (
-            np.concatenate(accumulated_routed_experts)
-            if accumulated_routed_experts
-            else None
-        )
+        if (
+            req.metadata.get("return_routed_experts", False)
+            and accumulated_output_tokens
+            and final_routed_experts is None
+        ):
+            raise RuntimeError(
+                "Requested return_routed_experts=True but no routed_experts were "
+                "received after abort/resubmit. This usually means the SGLang "
+                "server was not launched with enable_return_routed_experts=True "
+                "or the model is not a MoE model."
+            )
 
         response = ModelResponse(
             input_tokens=req.input_ids[
                 : len(req.input_ids) - len(accumulated_output_tokens)
             ],
             input_images=req.image_data,
+            sampler_head_ids=accumulated_head_ids
+            if gconfig.score_centering_top_k
+            else None,
+            sampler_head_logprobs=accumulated_head_logprobs
+            if gconfig.score_centering_top_k
+            else None,
             output_tokens=accumulated_output_tokens,
             output_logprobs=accumulated_output_logprobs,
             output_versions=accumulated_versions,
@@ -1234,7 +1292,7 @@ class RemoteInfEngine(InferenceEngine):
             ttft=latency,  # Simplified for non-streaming
             tokenizer=req.tokenizer,
             processor=req.processor,
-            routed_experts=accumulated_routed_experts,
+            routed_experts=final_routed_experts,
         )
         return response
 
@@ -1471,6 +1529,18 @@ class RemoteInfEngine(InferenceEngine):
         return self.workflow_executor.wait(
             count, timeout=timeout, raise_timeout=raise_timeout
         )
+
+    def get_rollout_result(
+        self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
+    ) -> dict[str, Any] | None:
+        """Transfer a result and its metrics without consuming them on the worker."""
+        result = self.workflow_executor.dispatcher.wait_for_task(
+            task_id, timeout, raise_timeout, consume=False, raise_terminal_error=False
+        )
+        if result is None or isinstance(result, WorkflowContractFailure):
+            return result
+        # Keep tensors inside plain containers for RPC RTensor.remotize.
+        return {"trajectory": result.trajectory, "metrics": result.metrics}
 
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True

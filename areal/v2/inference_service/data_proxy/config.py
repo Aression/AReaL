@@ -26,9 +26,15 @@ class DataProxyConfig:
 
     # ArealOpenAI client parameters (forwarded from AgentConfig)
     tool_call_parser: str = "qwen"
+    tool_call_parser_allow_recovery: bool = True
     reasoning_parser: str = "qwen3"
     engine_max_tokens: int | None = None
     chat_template_type: str = "hf"
+
+    # Internal R3 / native router replay parameters.
+    return_routed_experts: bool = False
+    r3_num_moe_layers: int | None = None
+    r3_topk: int | None = None
     message_preprocessors: tuple[str, ...] = ()
     prefix_matcher: str | None = None
     prm: PRMConfig = field(default_factory=PRMConfig)

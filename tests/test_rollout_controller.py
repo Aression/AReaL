@@ -5,8 +5,6 @@ import pytest
 import requests
 import torch
 
-from tests.utils import get_model_path
-
 from areal.api import (
     LocalInfServerInfo,
     ModelRequest,
@@ -22,7 +20,10 @@ from areal.api.cli_args import (
     SGLangConfig,
 )
 from areal.infra import RolloutController
-from areal.infra.controller.rollout_controller import _merge_worker_stats
+from areal.infra.controller.rollout_controller import (
+    _merge_worker_stats,
+    _RolloutResult,
+)
 from areal.infra.scheduler.local import LocalScheduler
 from areal.infra.workflow_executor import (
     WorkflowContractError,
@@ -116,8 +117,8 @@ class MockScheduler:
             resp = requests.post(callback_addr, json=dict(task_id=task_id))
             resp.raise_for_status()
             return task_id
-        # Handle controller-safe task result retrieval
-        elif method == "_wait_for_task_result":
+        # Handle wait_for_task method
+        elif method == "get_rollout_result":
             task_id = kwargs.get("task_id")
             if self.workflow_contract_error is not None:
                 return WorkflowContractFailure(message=self.workflow_contract_error)
@@ -125,7 +126,8 @@ class MockScheduler:
                 worker_id in self._pending_results
                 and task_id in self._pending_results[worker_id]
             ):
-                return self._pending_results[worker_id].pop(task_id)
+                result = self._pending_results[worker_id].pop(task_id)
+                return {"trajectory": result, "metrics": None}
             return None
         elif method == "wait":
             # Return a result from pending results if available
@@ -240,6 +242,65 @@ class TestRolloutControllerInitialization:
 
         controller.destroy()
 
+    @pytest.mark.parametrize("nnodes", [1, 2])
+    @pytest.mark.parametrize("awex", [False, True])
+    def test_separate_workers_launch_with_unique_awex_ranks(
+        self, monkeypatch, nnodes, awex
+    ):
+        from areal.engine import sglang_remote
+        from areal.engine.awex.plugins.sglang_plugin import _resolve_transfer_rank
+
+        config = create_test_config(backend=f"sglang:d{4 * nnodes}t2")
+        scheduler = MockScheduler()
+        scheduler.n_gpus_per_node = 8
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine, config=config, scheduler=scheduler
+        )
+        server_args = {"base_gpu_id": 0, "awex_colocate_mode": awex}
+        controller.initialize(role="rollout", server_args=server_args)
+        launches = [c for c in scheduler.engine_calls if c[1] == "launch_server"]
+        assert len(launches) == 4 * nnodes
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+        for name in ("AWEX_TRANSFER_RANK", "AWEX_TRANSFER_RANK_BASE", "RANK"):
+            monkeypatch.delenv(name, raising=False)
+        commands = []
+        children = []
+        monkeypatch.setattr(
+            sglang_remote.SGLangConfig,
+            "build_cmd_from_args",
+            lambda args: commands.append(args.copy()) or ["sglang.launch_server"],
+        )
+        monkeypatch.setattr(
+            sglang_remote.subprocess,
+            "Popen",
+            lambda *args, **kwargs: children.append(kwargs["env"]) or Mock(),
+        )
+        ranks = []
+        for rank, (_, _, _, kwargs) in enumerate(launches):
+            sglang_remote.SGLangBackend().launch_server(kwargs["server_args"].copy())
+            assert commands[-1]["base_gpu_id"] == 0
+            assert "_awex_transfer_rank_base" not in commands[-1]
+            if awex:
+                base = children[-1]["AWEX_TRANSFER_RANK_BASE"]
+                assert int(base) == (rank % 4) * 2
+                monkeypatch.setenv("AWEX_TRANSFER_RANK_BASE", base)
+                ranks.extend(
+                    _resolve_transfer_rank(
+                        infer_world_size=8 * nnodes,
+                        gpu_id=gpu,
+                        node_id=rank // 4,
+                        nnodes=nnodes,
+                        instance_world_size=2,
+                    )
+                    for gpu in range(2)
+                )
+            else:
+                assert "AWEX_TRANSFER_RANK_BASE" not in children[-1]
+        if awex:
+            assert ranks == list(range(8 * nnodes))
+        assert server_args == {"base_gpu_id": 0, "awex_colocate_mode": awex}
+        controller.destroy()
+
     def test_initialize_nonfork_colocation_uses_port_after_actor_rendezvous(self):
         """A reused actor worker reserves port 2 for SGLang NCCL."""
         config = create_test_config(
@@ -293,8 +354,13 @@ class TestRolloutControllerInitialization:
             call for call in scheduler.engine_calls if call[1] == "launch_server"
         ]
         assert len(launch_calls) == 2
+        base_gpu_ids = []
         for _, _, _, kwargs in launch_calls:
-            assert kwargs["server_args"]["nccl_port"] == 8001
+            server_args = kwargs["server_args"]
+            assert server_args["nccl_port"] == 8001
+            assert server_args["_awex_gpus_per_server"] == 1
+            base_gpu_ids.append(server_args["base_gpu_id"])
+        assert base_gpu_ids == [0, 1]
 
         controller.destroy()
 
@@ -1159,18 +1225,17 @@ def test_parametrized_capacity_settings(
     controller.destroy()
 
 
-QWEN3_PATH = get_model_path(
-    "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
-)
-
-
 @pytest.mark.sglang
-@pytest.mark.parametrize("model_path", [QWEN3_PATH])
 @pytest.mark.slow
 @pytest.mark.ci
-def test_rollout_controller_integration(tmp_path, model_path):
+def test_rollout_controller_integration(tmp_path):
+    from tests.utils import get_model_path
+
     from areal.engine.sglang_remote import RemoteSGLangEngine
 
+    model_path = get_model_path(
+        "/storage/openpsi/models/Qwen__Qwen3-0.6B/", "Qwen/Qwen3-0.6B"
+    )
     tokenizer = load_hf_tokenizer(model_path)
     fileroot = tmp_path / "fileroot"
     fileroot.mkdir()
@@ -1475,6 +1540,37 @@ class TestRolloutControllerExportStats:
         assert "reward" in stats or "loss" in stats
 
         controller.destroy()
+
+    def test_export_stats_includes_consumed_rejected_samples_once(self):
+        """Controller exports the pre-filter denominator as a visible count."""
+        controller = RolloutController(
+            inf_engine=MockInferenceEngine,
+            config=create_test_config(),
+            scheduler=MockScheduler(),
+        )
+        controller._collective_rpc = Mock(return_value=[{}])
+        controller.consumed_metrics.consume(
+            _RolloutResult(0, {}, {"rollout/reward": [1.0, 1.0]})
+        )
+        controller.consumed_metrics.consume(
+            _RolloutResult(
+                1,
+                None,
+                {
+                    "rollout/reward": [0.0],
+                    "rollout/task_attempt/success": [0.0, 0.0, 0.0],
+                    "rollout/harness_success": [0.0, 0.0],
+                    "rollout/harness_error": [1.0, 0.0],
+                },
+            )
+        )
+        stats = controller.export_stats()
+        assert stats["rollout/reward"] == pytest.approx(2 / 3)
+        assert stats["rollout/reward_sample_count"] == 3
+        assert stats["rollout/task_attempt_count"] == 3
+        assert stats["rollout/task_result_count"] == 2
+        assert stats["rollout/harness_error"] == 0.5
+        assert controller.export_stats() == {}
 
 
 class TestRolloutControllerRolloutStats:

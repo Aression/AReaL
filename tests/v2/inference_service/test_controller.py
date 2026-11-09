@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
@@ -10,6 +11,7 @@ import pytest
 
 from areal.api.cli_args import AgentConfig, InferenceEngineConfig
 from areal.utils import stats_tracker
+from areal.utils.rollout_metrics import ConsumedMetrics
 from areal.v2.inference_service.controller.controller import (
     RolloutControllerV2,
 )
@@ -470,6 +472,33 @@ class TestRolloutControllerV2Construction:
         finally:
             stats_tracker.export_all(reset=True)
 
+    def test_export_stats_includes_consumed_rejected_metrics_once(self):
+        controller = RolloutControllerV2(
+            config=InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key"),
+            scheduler=MagicMock(n_gpus_per_node=8),
+        )
+        consumed = ConsumedMetrics()
+        consumed.consume(
+            SimpleNamespace(
+                trajectory={"accepted": True},
+                metrics={"rollout/reward": [1.0], "rollout/accepted": [1.0]},
+            )
+        )
+        consumed.consume(
+            SimpleNamespace(
+                trajectory=None,
+                metrics={"rollout/reward": [0.0], "rollout/accepted": [0.0]},
+            )
+        )
+        controller._workflow_executor = SimpleNamespace(consumed_metrics=consumed)
+
+        with patch.object(stats_tracker, "export_all", side_effect=lambda: {}):
+            stats = controller.export_stats()
+            assert stats["rollout/reward"] == 0.5
+            assert stats["rollout/reward_sample_count"] == 2
+            assert stats["rollout/group_attempt_count"] == 2
+            assert controller.export_stats() == {}
+
     def test_proxy_gateway_addr(self):
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
@@ -525,6 +554,7 @@ class TestRolloutControllerV2Construction:
             tokenizer_path="mock-tokenizer",
             _version="v2",
             request_timeout=15.0,
+            return_routed_experts=True,
             deterministic_sampling=deterministic_sampling,
             agent=AgentConfig(
                 agent_cls_path="tests.experimental.openai.utils.SimpleAgent",
@@ -574,6 +604,8 @@ class TestRolloutControllerV2Construction:
                         host="127.0.0.1", port=30000, process=MagicMock()
                     )
                 ],
+                r3_num_moe_layers=27,
+                r3_topk=8,
             )
 
         data_proxy_calls = [
@@ -588,6 +620,11 @@ class TestRolloutControllerV2Construction:
         assert "7.5" in data_proxy_cmd
         assert "--callback-server-addr" in data_proxy_cmd
         assert "http://127.0.0.1:19000" in data_proxy_cmd
+        assert "--return-routed-experts" in data_proxy_cmd
+        assert "--r3-num-moe-layers" in data_proxy_cmd
+        assert "27" in data_proxy_cmd
+        assert "--r3-topk" in data_proxy_cmd
+        assert "8" in data_proxy_cmd
         assert ("--deterministic-sampling" in data_proxy_cmd) is deterministic_sampling
         assert data_proxy_cmd.count("--message-preprocessor") == 2
         first = data_proxy_cmd.index("--message-preprocessor")

@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from ..types import InteractionWithTokenLogpReward
     from .proxy_gateway import CompletedSessionInfo
 
+from ..types import configure_r3_interactions
+
 logger = logging.getLogger("OpenAIProxyWorkflow")
 
 
@@ -45,6 +47,7 @@ HARNESS_OUTCOME_METRIC_CODES = frozenset(
         "AGENT_RUN_TIMEOUT",
         "AUTONOMOUS_INCOMPLETE_NO_SHIP",
         "GAMEAGENT_RUN_FAILED",
+        "INVALID_TOOL_JSON",
         "LLM_CONTEXT_WINDOW_EXCEEDED",
         "LLM_RESPONSE_FAILED",
         "LLM_RESPONSE_TIMEOUT",
@@ -118,6 +121,8 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         export_style: str = "individual",
         subproc_max_workers: int = 4,
         proxy_gateway_addr: str | None = None,
+        r3_num_moe_layers: int | None = None,
+        r3_topk: int | None = None,
         drop_retry_orphans: bool = False,
     ):
         if mode not in ("inline", "subproc", "online"):
@@ -158,6 +163,19 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         self.subproc_max_workers = subproc_max_workers
         self.drop_retry_orphans = drop_retry_orphans
         self._shared_tensor_resolver = SharedTensorResolver()
+        self.r3_num_moe_layers = r3_num_moe_layers
+        self.r3_topk = r3_topk
+
+    def _configure_r3_interactions(
+        self,
+        interactions: dict[str, InteractionWithTokenLogpReward],
+    ) -> dict[str, InteractionWithTokenLogpReward]:
+        configure_r3_interactions(
+            interactions,
+            num_moe_layers=self.r3_num_moe_layers,
+            topk=self.r3_topk,
+        )
+        return interactions
 
     @trace_session("run_agent")
     async def _run_agent(
@@ -290,6 +308,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         context_overflow: bool,
         interaction_count: int,
         system_error: bool = False,
+        invalid_tool_json: bool = False,
     ) -> AgentFailureDisposition:
         """Classify whether an agent error is a trainable model failure.
 
@@ -305,13 +324,21 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         classifier = getattr(self.agent, "classify_proxy_failure", None)
         if classifier is None:
             return (
-                "model_failure_zero" if context_overflow else "unknown_failure_reject"
+                "model_failure_zero"
+                if context_overflow or invalid_tool_json
+                else "unknown_failure_reject"
             )
-        disposition = classifier(
-            error,
-            context_overflow=context_overflow,
-            interaction_count=interaction_count,
-        )
+        classifier_kwargs = {
+            "context_overflow": context_overflow,
+            "interaction_count": interaction_count,
+        }
+        # Preserve the existing hook signature for agents that do not opt in.
+        if (
+            invalid_tool_json
+            and "invalid_tool_json" in inspect.signature(classifier).parameters
+        ):
+            classifier_kwargs["invalid_tool_json"] = True
+        disposition = classifier(error, **classifier_kwargs)
         valid_dispositions = {
             "model_failure_zero",
             "system_failure_reject",
@@ -512,6 +539,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 drop_retry_orphans=self.drop_retry_orphans,
                 is_eval=workflow_context.get().is_eval,
             )
+            self._configure_r3_interactions(interactions)
 
             # Return None if no interactions (empty session — user never sent chat/completions)
             if not interactions:
@@ -567,13 +595,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 else:
                     raise ValueError(f"Invalid reward type: {type(rewards)}")
 
+        invalid_tool_json = bool(getattr(proxy_client, "invalid_tool_json", False))
         if (
             agent_error is None
-            and proxy_client.context_overflow
+            and (proxy_client.context_overflow or invalid_tool_json)
             and proxy_client.system_error
         ):
             agent_error = RuntimeError(
-                "Proxy session had a system failure as well as context overflow"
+                "Proxy session had a system failure as well as a model failure"
             )
         failure_disposition: AgentFailureDisposition | None = None
         if agent_error is not None:
@@ -582,6 +611,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 context_overflow=proxy_client.context_overflow,
                 interaction_count=proxy_client.interaction_count,
                 system_error=proxy_client.system_error,
+                invalid_tool_json=invalid_tool_json,
             )
             await self._call_agent_hook(
                 "record_failure_disposition",
@@ -606,6 +636,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             )
             stats_tracker.get(workflow_context.stat_scope()).scalar(
                 context_overflow=float(proxy_client.context_overflow),
+                invalid_tool_json=float(invalid_tool_json),
                 proxy_system_error=float(proxy_client.system_error),
             )
             return None
@@ -621,20 +652,28 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             )
             stats_tracker.get(workflow_context.stat_scope()).scalar(
                 context_overflow=float(proxy_client.context_overflow),
+                invalid_tool_json=float(invalid_tool_json),
                 proxy_system_error=float(proxy_client.system_error),
             )
             raise agent_error
 
-        if proxy_client.context_overflow or failure_disposition == "model_failure_zero":
+        recover_model_failure = (
+            proxy_client.context_overflow
+            or invalid_tool_json
+            or failure_disposition == "model_failure_zero"
+        )
+        if recover_model_failure:
             logger.warning(
                 "Recovering model failure with reward 0: context_overflow=%s, "
-                "interactions=%d, agent_error=%s",
+                "invalid_tool_json=%s, interactions=%d, agent_error=%s",
                 proxy_client.context_overflow,
+                invalid_tool_json,
                 proxy_client.interaction_count,
                 agent_error,
             )
             stats_tracker.get(workflow_context.stat_scope()).scalar(
                 context_overflow=float(proxy_client.context_overflow),
+                invalid_tool_json=float(invalid_tool_json),
                 proxy_system_error=float(proxy_client.system_error),
             )
             if proxy_client.interaction_count == 0:
@@ -648,13 +687,14 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         else:
             stats_tracker.get(workflow_context.stat_scope()).scalar(
                 context_overflow=0.0,
+                invalid_tool_json=0.0,
                 proxy_system_error=float(proxy_client.system_error),
             )
 
         # Request episode-return assignment while the proxy still owns the full
         # parent graph. This is an explicit agent opt-in, never a scalar default.
         export_kwargs = {}
-        if proxy_client.context_overflow or failure_disposition == "model_failure_zero":
+        if recover_model_failure:
             episode_reward = await self._call_agent_hook(
                 "get_failure_reward_for_export",
                 data,
@@ -664,7 +704,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
                 export_kwargs["episode_reward"] = episode_reward
         elif (
             agent_error is None
-            and not proxy_client.context_overflow
+            and not recover_model_failure
             and isinstance(rewards, float)
         ):
             episode_reward = await self._call_agent_hook(
@@ -684,6 +724,7 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
             is_eval=workflow_context.get().is_eval,
             **export_kwargs,
         )
+        self._configure_r3_interactions(interactions)
 
         if not interactions:
             logger.warning(

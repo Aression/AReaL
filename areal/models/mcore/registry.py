@@ -20,6 +20,7 @@ from transformers import AutoConfig, PretrainedConfig
 from areal.api.cli_args import MegatronEngineConfig
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.mtp_only import freeze_non_mtp_parameters
+from areal.engine.megatron_utils.qwen3_vl_token_mask import install_qwen3_vl_token_mask
 from areal.models.mcore.bailing_moe import (
     hf_to_mcore_config_bailing_moe,
     make_mcore_layer_specs_bailing_moe,
@@ -444,6 +445,25 @@ def make_mcore_model(
 
     if bridge is not None and bridge_type == "megatron-bridge":
         provider = bridge.to_megatron_provider(load_weights=False)
+        # Native VLM providers apply these policies in provide(), before DDP
+        # allocates gradient buffers and the optimizer selects parameters.
+        is_qwen_vl = getattr(hf_config, "model_type", None) in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        )
+        for option in ("freeze_vision_model", "freeze_vision_projection"):
+            freeze = getattr(mcore_config, option)
+            if freeze is None and is_qwen_vl:
+                freeze = True
+            if freeze is not None:
+                if not hasattr(provider, option):
+                    raise ValueError(
+                        f"{type(provider).__name__} does not support {option}; "
+                        "use a compatible vision-language model provider"
+                    )
+                setattr(provider, option, freeze)
         vpp_size = mcore_config.virtual_pipeline_parallel_size or 0
 
         provider.tensor_model_parallel_size = mpu.get_tensor_model_parallel_world_size()
@@ -507,6 +527,17 @@ def make_mcore_model(
         # Megatron main_grad buffers required by fused grad accumulation kernels.
         if use_lora:
             provider.gradient_accumulation_fusion = False
+        elif provider.gradient_accumulation_fusion:
+            # Bridge also enables fusion when only TE is available, but the
+            # native ColumnParallelLinear output head requires the Apex kernel.
+            try:
+                import fused_weight_gradient_mlp_cuda  # noqa: F401
+            except ImportError:
+                provider.gradient_accumulation_fusion = False
+                logger.warning(
+                    "Disabling gradient accumulation fusion: the native output "
+                    "head requires fused_weight_gradient_mlp_cuda."
+                )
 
         # Keep these four flags aligned with mbridge base defaults.
         provider.variable_seq_lengths = True
@@ -520,12 +551,22 @@ def make_mcore_model(
         provider.overlap_p2p_comm = (
             vpp_size > 1 and provider.pipeline_model_parallel_size > 1
         )
+        if mcore_config.enable_router_replay:
+            if bool(getattr(provider, "moe_router_fusion", False)):
+                raise ValueError(
+                    "megatron.enable_router_replay=True is incompatible with "
+                    "effective Megatron moe_router_fusion=True. Disable "
+                    "moe_router_fusion to use Megatron-Core native RouterReplay."
+                )
+            provider.moe_enable_routing_replay = True
 
         # Aligning tf config settings with provider for consistency.
         tf_config.variable_seq_lengths = provider.variable_seq_lengths
         tf_config.moe_token_dispatcher_type = provider.moe_token_dispatcher_type
         tf_config.batch_p2p_comm = provider.batch_p2p_comm
         tf_config.overlap_p2p_comm = provider.overlap_p2p_comm
+        if mcore_config.enable_router_replay:
+            tf_config.moe_enable_routing_replay = True
 
         # Megatron-Bridge creates a new provider instead of building from
         # ``tf_config`` directly. Apply the prebuild deterministic settings to
@@ -535,6 +576,14 @@ def make_mcore_model(
             set_deterministic_algorithms(provider, prebuild=True)
 
         provider.finalize()
+
+        if getattr(hf_config, "model_type", None) in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ):
+            provider.register_pre_wrap_hook(install_qwen3_vl_token_mask)
 
         if mcore_config.mtp_only:
             if getattr(provider, "moe_router_enable_expert_bias", False):
@@ -605,6 +654,8 @@ def make_mcore_model(
         return models
 
     else:
+        if mcore_config is not None and mcore_config.enable_router_replay:
+            tf_config.moe_enable_routing_replay = True
         if (
             mcore_config is not None
             and mcore_config.virtual_pipeline_parallel_size is not None

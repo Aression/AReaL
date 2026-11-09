@@ -250,6 +250,40 @@ def _pad_cat_dim0(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.
         for i in range(1, ndim):
             max_shape[i - 1] = max(max_shape[i - 1], t.shape[i])
 
+    # Small rollout groups are faster with padding and cat than per-input copies.
+    if len(tensors) >= 16:
+        padded_shape = torch.Size(max_shape)
+        if all(t.shape[1:] == padded_shape for t in tensors):
+            return torch.cat(tensors, dim=0)
+
+        first = tensors[0]
+        if (
+            type(first) is torch.Tensor
+            and not first.is_quantized
+            and all(
+                type(t) is torch.Tensor
+                and t.dtype == first.dtype
+                and t.device == first.device
+                and t.layout == torch.strided
+                and t.is_contiguous()
+                and not t.requires_grad
+                and all(size > 0 for size in t.shape[1:])
+                for t in tensors
+            )
+        ):
+            result = first.new_full(
+                (sum(t.shape[0] for t in tensors), *max_shape), pad_value
+            )
+            offset = 0
+            for t in tensors:
+                slices = (
+                    slice(offset, offset + t.shape[0]),
+                    *(slice(0, size) for size in t.shape[1:]),
+                )
+                result[slices].copy_(t)
+                offset += t.shape[0]
+            return result
+
     padded_tensors = []
     for t in tensors:
         pad_sizes = [max_shape[i - 1] - t.shape[i] for i in range(1, ndim)]
@@ -315,6 +349,8 @@ def concat_padded_tensors(
         values = [td[key] for td in tensor_dicts]
         if isinstance(values[0], torch.Tensor):
             pv = 0.0 if key == "attention_mask" else pad_value
+            if key == "sampler_head_logprobs":
+                pv = -float("inf")
             result[key] = _pad_cat_dim0(values, pad_value=pv)
         elif isinstance(values[0], list):
             result[key] = [item for v in values for item in v]
@@ -325,14 +361,14 @@ def concat_padded_tensors(
 
 
 def _unpad_splits(
-    splits: list[torch.Tensor], traj_seqlens: list[int] | None
+    splits: list[torch.Tensor], traj_seqlens: list[int] | None, *, seq_dim: int = -1
 ) -> list[torch.Tensor]:
-    """Trim each split tensor's last dim to its original sequence length."""
+    """Trim each split tensor's sequence dimension to its original length."""
     if traj_seqlens is None:
         return splits
     for i, s in enumerate(splits):
-        if s.ndim >= 2 and s.shape[-1] > traj_seqlens[i]:
-            splits[i] = s[..., : traj_seqlens[i]]
+        if s.ndim >= 2 and s.shape[seq_dim] > traj_seqlens[i]:
+            splits[i] = s.narrow(seq_dim, 0, traj_seqlens[i])
     return splits
 
 
@@ -347,6 +383,9 @@ def split_and_unpad_tensor(
 
     When traj_seqlens is None and result is a dict with attention_mask,
     seqlens are auto-derived via attention_mask.sum(-1).max() per group.
+    Multimodal lists (``multi_modal_input*``) contain one entry per batch row
+    and are split by trajectory group. Other non-tensor metadata is copied
+    unchanged into each trajectory.
     """
     if result is None:
         return None
@@ -372,10 +411,26 @@ def split_and_unpad_tensor(
         for key, value in result.items():
             if isinstance(value, torch.Tensor) and value.shape[0] == total:
                 splits = _unpad_splits(
-                    list(value.split(traj_group_sizes, dim=0)), traj_seqlens
+                    list(value.split(traj_group_sizes, dim=0)),
+                    traj_seqlens,
+                    seq_dim=1
+                    if key
+                    in ("routed_experts", "sampler_head_ids", "sampler_head_logprobs")
+                    else -1,
                 )
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
+            elif is_multi_modal_key(key) and isinstance(value, list):
+                if len(value) != total:
+                    raise ValueError(
+                        f"{key} must contain {total} batch rows, got {len(value)}"
+                    )
+                offset = 0
+                for i, group_size in enumerate(traj_group_sizes):
+                    split_result[i][key] = copy.deepcopy(
+                        value[offset : offset + group_size]
+                    )
+                    offset += group_size
             else:
                 for i in range(n_trajs):
                     split_result[i][key] = copy.deepcopy(value)
@@ -530,7 +585,9 @@ def unpack_sequence(
     raise ValueError("Either cu_seqlens or input_lens must be provided.")
 
 
-def allocate_balanced_mbs(mb_spec: MicroBatchSpec, lens: list[int]) -> list[list[int]]:
+def allocate_balanced_mbs(
+    mb_spec: MicroBatchSpec, lens: list[int], padded: bool = False
+) -> list[list[int]]:
     """Allocate sequences into balanced micro-batches using the configured algorithm.
 
     The packing algorithm is determined by ``mb_spec.packing_algorithm``:
@@ -546,7 +603,11 @@ def allocate_balanced_mbs(mb_spec: MicroBatchSpec, lens: list[int]) -> list[list
         List of lists of indices, one per micro-batch.
     """
     assert mb_spec.max_tokens_per_mb is not None
-    allocate_fn = get_allocate_fn(getattr(mb_spec, "packing_algorithm", "ffd"))
+    allocate_fn = (
+        seqpack.padded_allocate
+        if padded
+        else get_allocate_fn(getattr(mb_spec, "packing_algorithm", "ffd"))
+    )
     group_indices = allocate_fn(
         lens,
         mb_spec.max_tokens_per_mb,
@@ -561,8 +622,9 @@ def allocate_balanced_mbs_synced(
     mb_spec: MicroBatchSpec,
     lens: list[int],
     group: dist.ProcessGroup | None = None,
+    padded: bool = False,
 ) -> list[list[int]]:
-    group_indices = allocate_balanced_mbs(mb_spec, lens)
+    group_indices = allocate_balanced_mbs(mb_spec, lens, padded=padded)
     if not dist.is_initialized():
         return group_indices
     all_n_mbs = [None for _ in range(dist.get_world_size(group))]
@@ -570,7 +632,10 @@ def allocate_balanced_mbs_synced(
     if all(mbs == len(group_indices) for mbs in all_n_mbs):
         return group_indices
     return allocate_balanced_mbs_synced(
-        MicroBatchSpec.new(mb_spec, n_mbs=max(all_n_mbs)), lens, group=group
+        MicroBatchSpec.new(mb_spec, n_mbs=max(all_n_mbs)),
+        lens,
+        group=group,
+        padded=padded,
     )
 
 
@@ -880,6 +945,8 @@ def split_padded_tensor_dict_into_mb_list(
     allow_transport_padding: bool = False,
     *,
     sync_mbs: bool = True,
+    seq_align_to: int | None = None,
+    padded: bool = False,
 ) -> MicroBatchList:
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
@@ -887,6 +954,11 @@ def split_padded_tensor_dict_into_mb_list(
         data (Dict): Dictionary containing padded tensors.
         mb_spec (MicroBatchSpec): Specification for micro-batch splitting.
         group (Optional[dist.ProcessGroup]): Process group for distributed synchronization.
+        seq_align_to: Optional per-sequence alignment applied after packing. When set,
+            aligned lengths are used for micro-batch allocation so padding cannot make
+            a micro-batch exceed ``max_tokens_per_mb``.
+        padded: Budget the rectangular forward input (batch size times aligned
+            maximum sequence length), grouping similar lengths together.
         allow_transport_padding: Add model-valid rows when execution requires
             more micro-batches than local semantic data can provide.
         sync_mbs: Synchronize micro-batch counts across ranks. Engines that pad
@@ -924,27 +996,37 @@ def split_padded_tensor_dict_into_mb_list(
                 f"Batch size {bs} cannot divide granularity {granularity}."
             )
         max_seqlen = data["attention_mask"].shape[1]
-        seq_lens = data["attention_mask"].sum(1).long().cpu().numpy().tolist()
+        seq_lens_array = data["attention_mask"].sum(1).long().cpu().numpy()
+        seq_lens = seq_lens_array.tolist()
+        packing_seq_lens = seq_lens_array
+        if seq_align_to is not None:
+            if seq_align_to <= 0:
+                raise ValueError(f"seq_align_to must be positive, got {seq_align_to}.")
+            packing_seq_lens = (
+                (packing_seq_lens + seq_align_to - 1) // seq_align_to * seq_align_to
+            )
+        grouped_lens = packing_seq_lens.reshape(bs // granularity, granularity)
         input_lens = (
-            data["attention_mask"]
-            .view(bs // granularity, granularity, -1)
-            .sum(dim=(1, 2))
-            .long()
-            .cpu()
-            .numpy()
+            grouped_lens.max(axis=1) * granularity
+            if padded
+            else grouped_lens.sum(axis=1)
         )
-        if transport_dummy_count:
+        if transport_dummy_count and not padded:
             input_lens[-transport_dummy_count // granularity :] = 0
 
         if not allow_transport_padding:
             group_indices = (
-                allocate_balanced_mbs_synced(allocation_spec, input_lens, group=group)
+                allocate_balanced_mbs_synced(
+                    allocation_spec, input_lens, group=group, padded=padded
+                )
                 if sync_mbs
-                else allocate_balanced_mbs(allocation_spec, input_lens)
+                else allocate_balanced_mbs(allocation_spec, input_lens, padded=padded)
             )
             break
 
-        group_indices = allocate_balanced_mbs(allocation_spec, input_lens)
+        group_indices = allocate_balanced_mbs(
+            allocation_spec, input_lens, padded=padded
+        )
         if not sync_mbs or not dist.is_initialized():
             break
         all_n_mbs: list[int | None] = [None] * dist.get_world_size(group)
@@ -963,7 +1045,7 @@ def split_padded_tensor_dict_into_mb_list(
     for key, value in data.items():
         if key in multimodal_keys:
             continue
-        if key == "position_ids" or (
+        if key in ("position_ids", "sampler_head_ids", "sampler_head_logprobs") or (
             torch.is_tensor(value) and value.numel() == bs * max_seqlen
         ):
             # NOTE: qwen2.5-vl position_ids.numel() == bs * max_seqlen * 3
@@ -1203,6 +1285,14 @@ def pad_packed_tensor_dict(
                             new_end - new_start, dtype=value.dtype, device=value.device
                         )
                 sequence_padded_data[key] = new_value
+            elif key in ("sampler_head_ids", "sampler_head_logprobs"):
+                fill = float("-inf") if key == "sampler_head_logprobs" else 0
+                new_value = value.new_full((padded_shape[0], *value.shape[1:]), fill)
+                for i in range(batch_size):
+                    start, end = cu_seqlens[i], cu_seqlens[i + 1]
+                    new_start = cu_seqlens_padded[i]
+                    new_value[new_start : new_start + end - start] = value[start:end]
+                sequence_padded_data[key] = new_value
             elif torch.is_tensor(value) and value.numel() == total_length:
                 new_value = torch.full(
                     padded_shape,
@@ -1272,6 +1362,10 @@ def pad_packed_tensor_dict(
                 pad = torch.arange(pad_length, dtype=torch.long, device=value.device)
                 padded_tensor = torch.cat([value, pad])
             padded_data[key] = padded_tensor
+        elif key in ("sampler_head_ids", "sampler_head_logprobs"):
+            fill = float("-inf") if key == "sampler_head_logprobs" else 0
+            pad = value.new_full((pad_length, *value.shape[1:]), fill)
+            padded_data[key] = torch.cat([value, pad], dim=0)
         elif torch.is_tensor(value) and value.numel() == total_length:
             # Pad the tensor to the new total length
             padded_tensor = torch.nn.functional.pad(
@@ -1381,7 +1475,9 @@ def pad_mb_list(
         }
         padded_mb_inputs.append(padded_mb)
         pad_lengths.append(pad_len)
-        pad_to_lengths.append(pad_to_length)
+        pad_to_lengths.append(
+            (align_to_length if align_to_length is not None else length) + pad_len
+        )
         old_cu_seqlens_list.append(old_cu_seqlens)
         align_to_lengths.append(align_to_length)
     mb_list.padded_mbs = padded_mb_inputs
@@ -2034,10 +2130,13 @@ def normalize_rollout_rewards(
     reward_scaling: float = 1.0,
     reward_clip: float = float("inf"),
     unpenalized_rewards: torch.Tensor | None = None,
+    normalization_rewards: torch.Tensor | None = None,
+    require_shaped_references: bool = False,
     reduce_group=None,
 ) -> torch.Tensor:
     """Normalize row scores against one reference per logical rollout.
 
+    Shaped ``normalization_rewards``, when supplied, override raw references.
     Explicit references bypass row-length penalties; all scores share the
     actor's bias, scaling and clipping. Missing references require equal rows.
     """
@@ -2067,10 +2166,31 @@ def normalize_rollout_rewards(
         scores.new_tensor([r if r is not None else 0.0 for r in explicit]),
         row_rewards[starts],
     )
-    equal_rows = row_rewards == reference[member]
-    if unpenalized_rewards is not None:
-        equal_rows &= unpenalized_rewards == unpenalized_rewards[starts][member]
-    invalid_reference = torch.any(~supplied[member] & ~equal_rows)
+    if normalization_rewards is not None:
+        if not isinstance(normalization_rewards, torch.Tensor):
+            raise TypeError("normalization_rewards must be a tensor")
+        if (
+            normalization_rewards.shape != reference.shape
+            or normalization_rewards.device != row_rewards.device
+        ):
+            raise ValueError(
+                "normalization_rewards must match the logical rollout count and reward device"
+            )
+        if not torch.is_floating_point(normalization_rewards):
+            raise TypeError("normalization_rewards must be floating-point")
+        torch._assert_async(
+            torch.all(torch.isfinite(normalization_rewards)),
+            "normalization_rewards must be finite",
+        )
+        reference = normalization_rewards
+        invalid_reference = torch.zeros((), dtype=torch.bool, device=row_rewards.device)
+    else:
+        equal_rows = row_rewards == reference[member]
+        if unpenalized_rewards is not None:
+            equal_rows &= unpenalized_rewards == unpenalized_rewards[starts][member]
+        invalid_reference = torch.any(~supplied[member] & ~equal_rows)
+        if require_shaped_references:
+            invalid_reference |= supplied.any()
     if dist.is_initialized() and (
         norm.mean_level == "batch" or norm.std_level == "batch"
     ):
@@ -2078,7 +2198,8 @@ def normalize_rollout_rewards(
     torch._assert_async(
         ~invalid_reference,
         "Split rollout row rewards differ; supply an explicit rollout_reward "
-        "for reward normalization.",
+        "for reward normalization. Custom outcome shaping of explicit references "
+        "requires normalization_rewards.",
     )
     reference = ((reference + reward_bias) * reward_scaling).clamp(
         min=-reward_clip, max=reward_clip

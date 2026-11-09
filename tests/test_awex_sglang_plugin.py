@@ -9,14 +9,14 @@ import pytest
 import torch
 
 from areal.api.cli_args import MegatronEngineConfig, PPOActorConfig
-from areal.engine.awex.colocate_reader import (
-    _get_awex_infer_hf_config,
+from areal.engine.awex.adapters.sglang_adapter import (
+    _get_legacy_awex_hf_config,
     _get_router_dtype,
     _PhysicalDeviceMetaServerClient,
 )
 from areal.engine.awex.memory_saver import patch_tms_hook_mode
 from areal.engine.awex.metadata import serialize_metadata_gc
-from areal.engine.awex.sglang_plugin import (
+from areal.engine.awex.plugins.sglang_plugin import (
     AwexSchedulerPlugin,
     _load_sglang_plugins_if_available,
     _resolve_transfer_rank,
@@ -25,7 +25,7 @@ from areal.engine.awex.sglang_plugin import (
 
 
 def test_load_sglang_plugins_accepts_runtime_without_registry(monkeypatch):
-    import areal.engine.awex.sglang_plugin as plugin_module
+    import areal.engine.awex.plugins.sglang_plugin as plugin_module
 
     def _missing_registry(name):
         assert name == "sglang.srt.plugins"
@@ -92,7 +92,7 @@ def test_native_scheduler_hook_preserves_loops_and_runs_once(monkeypatch):
 
 
 def test_awex_config_preserves_nested_router_and_vision_metadata(monkeypatch):
-    import areal.engine.awex.colocate_reader as reader
+    import areal.engine.awex.adapters.sglang_adapter as reader
 
     composite = object()
 
@@ -104,7 +104,7 @@ def test_awex_config_preserves_nested_router_and_vision_metadata(monkeypatch):
         }
 
     monkeypatch.setattr(reader, "simple_hf_config", serialize)
-    config = _get_awex_infer_hf_config(
+    config = _get_legacy_awex_hf_config(
         SimpleNamespace(config=object()),
         SimpleNamespace(model_config=SimpleNamespace(hf_config=composite)),
     )
@@ -157,6 +157,123 @@ def test_memory_transitions_are_idempotent(monkeypatch):
         ("release", ["kv_cache"]),
         ("resume", ["kv_cache"]),
     ]
+
+
+@pytest.mark.parametrize("separate_updater", [False, True])
+@pytest.mark.parametrize("frozen_visual", [False, True])
+def test_successful_flush_reencodes_images_after_weight_update(
+    monkeypatch, separate_updater, frozen_visual
+):
+    import sys
+
+    embeddings = {}
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.mm_utils",
+        SimpleNamespace(embedding_cache=embeddings),
+    )
+    flush_calls = []
+    owner = SimpleNamespace(
+        release_memory_occupation=lambda request: None,
+        resume_memory_occupation=lambda request: None,
+    )
+
+    def flush_cache(empty_cache=True):
+        flush_calls.append(empty_cache)
+        return True
+
+    owner.flush_cache = flush_cache
+    scheduler = SimpleNamespace(flush_cache=flush_cache)
+    if separate_updater:
+        scheduler.weight_updater = owner
+    else:
+        scheduler = owner
+    scheduler._request_dispatcher = SimpleNamespace(_mapping={"flush": flush_cache})
+    plugin = AwexSchedulerPlugin(scheduler)
+    plugin._visual_embeddings_frozen = frozen_visual
+    plugin._patch_memory_transitions()
+    patched_flush = scheduler.flush_cache
+    plugin._patch_memory_transitions()
+    assert scheduler.flush_cache is patched_flush
+
+    version = 0
+    encodes = []
+
+    def image_embedding():
+        if "same-image" not in embeddings:
+            encodes.append(version)
+            embeddings["same-image"] = version
+        return embeddings["same-image"]
+
+    assert image_embedding() == 0
+    version = 59
+    assert image_embedding() == 0
+    assert scheduler._request_dispatcher._mapping["flush"](empty_cache=False)
+    # First synchronization establishes the actor's frozen checkpoint too.
+    assert embeddings == {}
+    assert image_embedding() == 59
+    version = 100
+    assert scheduler.flush_cache(empty_cache=False)
+    if frozen_visual:
+        assert embeddings == {"same-image": 59}
+        assert image_embedding() == 59
+        assert encodes == [0, 59]
+    else:
+        assert embeddings == {}
+        assert image_embedding() == 100
+        assert encodes == [0, 59, 100]
+    assert flush_calls == [False, False]
+    assert owner.flush_cache is scheduler.flush_cache
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_unsuccessful_flush_preserves_image_embeddings(monkeypatch, raises):
+    import sys
+
+    embeddings = {"same-image": object()}
+    before = embeddings.copy()
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.mm_utils",
+        SimpleNamespace(embedding_cache=embeddings),
+    )
+
+    def flush_cache():
+        if raises:
+            raise RuntimeError("flush failed")
+        return False
+
+    scheduler = SimpleNamespace(
+        release_memory_occupation=lambda request: None,
+        resume_memory_occupation=lambda request: None,
+        flush_cache=flush_cache,
+    )
+    AwexSchedulerPlugin(scheduler)._patch_memory_transitions()
+
+    if raises:
+        with pytest.raises(RuntimeError, match="flush failed"):
+            scheduler.flush_cache()
+    else:
+        assert scheduler.flush_cache() is False
+    assert embeddings == before
+
+
+def test_successful_flush_accepts_uninitialized_image_cache(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.managers.mm_utils",
+        SimpleNamespace(embedding_cache=None),
+    )
+    scheduler = SimpleNamespace(
+        release_memory_occupation=lambda request: None,
+        resume_memory_occupation=lambda request: None,
+        flush_cache=lambda: True,
+    )
+    AwexSchedulerPlugin(scheduler)._patch_memory_transitions()
+
+    assert scheduler.flush_cache() is True
 
 
 def test_tms_hook_mode_stays_preload_after_initialization(monkeypatch):
@@ -222,18 +339,19 @@ def test_awex_meta_client_uses_physical_device_for_colocate_identity():
 
 
 def test_awex_weight_update_runs_without_grad_tracking():
-    from areal.engine.awex.colocate_reader import AwexColocateReader
+    from areal.engine.awex.adapters.sglang_adapter import AwexSGLangAdapter
 
     grad_modes = []
     reader = SimpleNamespace(
         update_weights=lambda step_id: grad_modes.append(torch.is_grad_enabled())
     )
-    instance = AwexColocateReader(SimpleNamespace())
+    instance = object.__new__(AwexSGLangAdapter)
     instance._initialized = True
+    instance._qwen4_frozen_contract = None
     instance._ensure_reader = lambda: reader
     instance._rebuild_derived_weights = lambda: None
 
-    AwexColocateReader.update_weights(instance, 1)
+    AwexSGLangAdapter.update_weights(instance, 1)
 
     assert grad_modes == [False]
 
@@ -281,6 +399,23 @@ def test_transfer_rank_uses_scheduler_gpu_for_multi_gpu_server(monkeypatch):
     assert ranks == [16, 17, 18, 19]
 
 
+def test_transfer_rank_uses_dense_base_for_noncontiguous_devices(monkeypatch):
+    monkeypatch.setenv("AWEX_TRANSFER_RANK_BASE", "2")
+
+    ranks = [
+        _resolve_transfer_rank(
+            infer_world_size=8,
+            gpu_id=gpu_id,
+            node_id=0,
+            nnodes=1,
+            instance_world_size=2,
+        )
+        for gpu_id in range(2)
+    ]
+
+    assert ranks == [2, 3]
+
+
 def test_transfer_rank_falls_back_to_node_local_identity(monkeypatch):
     monkeypatch.delenv("AWEX_TRANSFER_RANK", raising=False)
     monkeypatch.delenv("RANK", raising=False)
@@ -307,6 +442,55 @@ def test_physical_gpu_id_uses_noncontiguous_visible_device(monkeypatch):
     assert _writer_version_key("10.0.0.1", gpu_id) == "awex_writer_version_10.0.0.1_5"
 
 
+@pytest.mark.parametrize("node_id", [0, 1])
+@pytest.mark.parametrize("isolated", [False, True])
+@pytest.mark.parametrize("frozen_visual", [None, False, True, "true"])
+def test_receiver_init_tp_servers_register_unique_ranks(
+    monkeypatch, node_id, isolated, frozen_visual
+):
+    """Transfer ranks stay dense with both isolated and fully visible GPUs."""
+    import awex.meta.meta_server as meta_server
+
+    monkeypatch.delenv("AWEX_TRANSFER_RANK", raising=False)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "16")
+    monkeypatch.setenv("SLURM_NODEID", str(node_id))
+    monkeypatch.setenv("SLURM_NNODES", "2")
+    train_info = {"train_world_size": 16}
+    if frozen_visual is not None:
+        train_info["frozen_visual_embeddings"] = frozen_visual
+    client = SimpleNamespace(get_object=lambda *args, **kwargs: train_info)
+    monkeypatch.setattr(meta_server, "MetaServerClient", lambda *args: client)
+    registrations = []
+
+    for first_gpu in range(0, 8, 2):
+        monkeypatch.setenv("AWEX_TRANSFER_RANK_BASE", str(first_gpu))
+        visible_devices = (
+            f"{first_gpu},{first_gpu + 1}" if isolated else "0,1,2,3,4,5,6,7"
+        )
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible_devices)
+        base_gpu_id = 0 if isolated else first_gpu
+        for logical_gpu in range(2):
+            scheduler = SimpleNamespace(
+                gpu_id=base_gpu_id + logical_gpu,
+                server_args=SimpleNamespace(
+                    tp_size=2, pp_size=1, base_gpu_id=base_gpu_id
+                ),
+            )
+            plugin = AwexSchedulerPlugin(scheduler)
+            plugin._receiver = SimpleNamespace(
+                initialize=lambda **kwargs: registrations.append(kwargs)
+            )
+
+            plugin._init_receiver_from_meta_server("127.0.0.1:1")
+            assert plugin._visual_embeddings_frozen is (frozen_visual is True)
+
+    assert [r["transfer_rank"] for r in registrations] == list(
+        range(node_id * 8, (node_id + 1) * 8)
+    )
+    assert [r["local_gpu_id"] for r in registrations] == list(range(8))
+
+
 def test_physical_gpu_id_rejects_uuid_visible_device(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-deadbeef")
 
@@ -327,14 +511,14 @@ def test_awex_rejects_megatron_without_ddp_flat_buffers():
     "installed", ["0.5.9", "0.5.10.post1", "0.5.18.dev10+g85b539146"]
 )
 def test_supported_sglang_builds_are_accepted(monkeypatch, installed):
-    import areal.engine.awex.sglang_plugin as plugin
+    import areal.engine.awex.plugins.sglang_plugin as plugin
 
     monkeypatch.setattr(plugin.pkg_version, "get_version", lambda name: installed)
     plugin.assert_supported_sglang_version()
 
 
 def test_unverified_sglang_build_is_rejected(monkeypatch):
-    import areal.engine.awex.sglang_plugin as plugin
+    import areal.engine.awex.plugins.sglang_plugin as plugin
 
     monkeypatch.setattr(plugin.pkg_version, "get_version", lambda name: "0.5.19.dev126")
     with pytest.raises(RuntimeError, match="Re-check Scheduler"):
@@ -347,7 +531,7 @@ def test_unverified_sglang_build_is_rejected(monkeypatch):
 def test_awex_reader_uses_model_device_independent_of_physical_ids(
     monkeypatch, visible, logical
 ):
-    from areal.engine.awex.colocate_reader import _DeviceBoundWeightsReader
+    from areal.engine.awex.adapters.sglang_adapter import _DeviceBoundWeightsReader
 
     if visible is None:
         monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -369,7 +553,7 @@ def test_awex_reader_uses_model_device_independent_of_physical_ids(
 
 
 def test_awex_reader_rejects_model_weights_still_on_cpu():
-    from areal.engine.awex.colocate_reader import _DeviceBoundWeightsReader
+    from areal.engine.awex.adapters.sglang_adapter import _DeviceBoundWeightsReader
 
     with pytest.raises(RuntimeError, match="model weights resumed on CUDA"):
         _DeviceBoundWeightsReader(model=torch.nn.Linear(2, 2))
@@ -406,7 +590,7 @@ def test_scheduler_dispatcher_captures_gc_guard_and_registration_is_idempotent(
 ):
     import sys
 
-    import areal.engine.awex.sglang_plugin as plugin_module
+    import areal.engine.awex.plugins.sglang_plugin as plugin_module
 
     class Scheduler:
         def __init__(self):
@@ -519,7 +703,9 @@ def test_metadata_gc_guard_releases_lock_after_failure():
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("location", ["scheduler", "worker", "runner", "worker_direct"])
 def test_legacy_model_worker_callback_preserves_native_tp_rank(rank, location):
-    from areal.engine.awex.sglang_plugin import _patch_execute_task_in_model_worker
+    from areal.engine.awex.plugins.sglang_plugin import (
+        _patch_execute_task_in_model_worker,
+    )
 
     runner = SimpleNamespace(model=object())
     worker = SimpleNamespace(model_runner=runner)
@@ -551,7 +737,9 @@ def test_legacy_model_worker_callback_preserves_native_tp_rank(rank, location):
 
 @pytest.mark.parametrize("rank", [None, -1, 4])
 def test_legacy_model_worker_callback_rejects_unresolved_or_invalid_tp_rank(rank):
-    from areal.engine.awex.sglang_plugin import _patch_execute_task_in_model_worker
+    from areal.engine.awex.plugins.sglang_plugin import (
+        _patch_execute_task_in_model_worker,
+    )
 
     scheduler = SimpleNamespace(
         tp_rank=rank,
@@ -567,7 +755,9 @@ def test_legacy_model_worker_callback_rejects_unresolved_or_invalid_tp_rank(rank
 
 
 def test_legacy_model_worker_callback_allows_single_rank_without_parallel_state():
-    from areal.engine.awex.sglang_plugin import _patch_execute_task_in_model_worker
+    from areal.engine.awex.plugins.sglang_plugin import (
+        _patch_execute_task_in_model_worker,
+    )
 
     scheduler = SimpleNamespace(
         server_args=SimpleNamespace(tp_size=1),

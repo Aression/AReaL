@@ -25,6 +25,9 @@ def launched_servers(monkeypatch):
         return SimpleNamespace(pid=1)
 
     monkeypatch.setattr(sglang_remote.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        sglang_remote, "find_free_ports", lambda *_args, **_kwargs: [19001]
+    )
     return calls
 
 
@@ -43,7 +46,7 @@ def _meta(tp=8, pp=1, dp=2):
     [
         (None, False, "areal.v2.inference_service.sglang.launch_server"),
         ("theta", False, "sglang.launch_server"),
-        ("theta", True, "areal.engine.awex.sglang_plugin"),
+        ("theta", True, "areal.engine.awex.plugins.sglang_plugin"),
     ],
 )
 def test_launch_selects_native_theta_only_without_awex(
@@ -73,6 +76,8 @@ def test_launch_selects_native_theta_only_without_awex(
         "8",
         "--port",
         "30000",
+        "--nccl-port",
+        "19001",
     ]
     assert backend.get_health_check_request().endpoint == (
         "/model_info" if awex else "/health"
@@ -91,7 +96,7 @@ def test_awex_environment_keeps_plugin_entrypoint(monkeypatch, launched_servers)
     assert launched_servers[0][0][2:6] == [
         "areal.engine.sglang_model_patches",
         "--entrypoint",
-        "areal.engine.awex.sglang_plugin",
+        "areal.engine.awex.plugins.sglang_plugin",
         "--",
     ]
 
