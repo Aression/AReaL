@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Plot the 30-step score-centering warm-up arms from metrics.csv.
 
+Arms are SC on/off plus the noise level injected to emulate sampler drift:
+``n0`` = no noise, ``n002`` = 0.02 Gaussian noise.
+
 Only ``src == live`` rows are plotted: the CSV also carries a
 ``snapshot-0131`` block for one arm that comes from a different source and has
 no entropy column, so mixing it in would fabricate a continuation.
@@ -18,10 +21,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 ARMS = [
-    ("sc-off-n0", "SC off · n0", "#9E9E9E", "-"),
-    ("sc-off-n002", "SC off · n002 (12 steps)", "#FF5722", "-"),
-    ("sc-on-n0", "SC on · n0", "#2196F3", "-"),
-    ("sc-on-n002", "SC on · n002", "#4CAF50", "-"),
+    ("sc-off-n0", "SC off · no noise", "#9E9E9E", "-"),
+    ("sc-off-n002", "SC off · 0.02 noise (12 live steps)", "#FF5722", "-"),
+    ("sc-on-n0", "SC on · no noise", "#2196F3", "-"),
+    ("sc-on-n002", "SC on · 0.02 noise", "#4CAF50", "-"),
 ]
 
 
