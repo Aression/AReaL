@@ -18,10 +18,10 @@ index d1f7c3a..33ecd81 100644
              output_tokens=[1, 2, 3],
 diff --git a/tests/test_score_centering.py b/tests/test_score_centering.py
 new file mode 100644
-index 0000000..30168a2
+index 0000000..9b588f2
 --- /dev/null
 +++ b/tests/test_score_centering.py
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,470 @@
 +# SPDX-License-Identifier: Apache-2.0
 +import copy
 +from types import SimpleNamespace
@@ -454,12 +454,50 @@ index 0000000..30168a2
 +            use_score_centering=True,
 +            sc_correction=torch.zeros_like(logprobs),
 +        )
++
++
++def test_missing_heads_raise_value_error_not_keyerror():
++    """SC on + a micro-batch without heads must name the missing key."""
++    from areal.engine.fsdp_engine import FSDPEngine, FSDPTrainContext
++
++    config = PPOActorConfig(
++        backend="fsdp:d1", use_score_centering=True, recompute_logprob=False
++    )
++    engine = FSDPEngine.__new__(FSDPEngine)
++    engine.config = config
++    engine.enable_tree_training = False
++    engine.parallel_helper = SimpleNamespace(tp_size=1, sp_size=1)
++    engine.model_config = SimpleNamespace(vocab_size=17)
++
++    mb = {
++        "input_ids": torch.arange(4)[None],
++        "attention_mask": torch.ones(1, 4, dtype=torch.bool),
++        "loss_mask": torch.tensor([[0, 1, 1, 0]]),
++        "logprobs": torch.zeros(1, 4),
++        "advantages": torch.zeros(1, 4),
++    }
++    ctx = FSDPTrainContext(model_inputs={"input_ids": mb["input_ids"]}, mb_input=mb)
++    logits = torch.randn(4, 17, requires_grad=True)
++    args = (
++        logits,
++        ctx,
++        lambda *a, **k: logits.mean(),
++        lambda d: d["loss_mask"].count_nonzero(),
++        mb["loss_mask"].sum(),
++    )
++    with pytest.raises(ValueError, match="no sampler top-k heads"):
++        engine._compute_logprobs_and_loss(*args)
++
++    # Only one of the two keys present must fail with the same, key-named error.
++    mb["sampler_head_ids"] = torch.zeros(4, 2, dtype=torch.int32)
++    with pytest.raises(ValueError, match="missing sampler_head_logprobs"):
++        engine._compute_logprobs_and_loss(*args)
 diff --git a/tests/test_score_centering_guards.py b/tests/test_score_centering_guards.py
 new file mode 100644
-index 0000000..06876d7
+index 0000000..77dd0bb
 --- /dev/null
 +++ b/tests/test_score_centering_guards.py
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,232 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Guards that keep Score Centering from silently running headless or misaligned.
 +
@@ -478,18 +516,21 @@ index 0000000..06876d7
 +    PPOConfig,
 +    RejectionSamplingConfig,
 +)
++from areal.engine.vllm_remote import _parse_top_logprobs, _token_to_id
 +from areal.experimental.openai.client import drop_vision_pad_tokens
-+from areal.infra.remote_inf_engine import require_topk_heads
++from areal.infra.remote_inf_engine import require_topk_heads, validate_head_alignment
++from areal.utils.data import _TOKEN_PAYLOAD_KEYS
++from areal.utils.topk_padding import NEG_INF_PAD, zero_mass_row_count
 +
 +
 +def test_requested_heads_but_none_returned_raises():
 +    """SC on + every chunk headless must fail loudly, not continue headless."""
 +    with pytest.raises(RuntimeError, match="no chunk returned sampler top-k heads"):
-+        require_topk_heads([], 128)
++        require_topk_heads([], 128, requested=True)
 +    # SC off: no heads is the normal case
-+    require_topk_heads([], 0)
++    require_topk_heads([], 0, requested=True)
 +    # SC on with heads present: fine
-+    require_topk_heads([[[1, 2]]], 128)
++    require_topk_heads([[[1, 2]]], 128, requested=True)
 +
 +
 +def test_v2_rollout_controller_is_rejected_at_load_time():
@@ -547,6 +588,148 @@ index 0000000..06876d7
 +    assert response.output_logprobs == [-0.1, -0.3]
 +    assert response.sampler_head_ids == [[11, 1], [12, 1]]
 +    assert response.sampler_head_logprobs == [[-0.1, -9.0], [-0.3, -9.0]]
++
++
++def test_guard_keys_off_the_score_centering_switch():
++    """SC off with a leftover top-k width must not abort the rollout."""
++    require_topk_heads([], 8, requested=False)  # must not raise
++    with pytest.raises(RuntimeError, match="no chunk returned sampler top-k heads"):
++        require_topk_heads([], 8, requested=True)
++
++
++def test_actor_switch_is_mirrored_to_the_engine_config():
++    """The transport cannot see actor.use_score_centering, so it is mirrored."""
++    on = PPOConfig(
++        actor=PPOActorConfig(backend="fsdp:d1", use_score_centering=True),
++        rollout=InferenceEngineConfig(backend="vllm:d1"),
++        gconfig=GenerationHyperparameters(score_centering_top_k=2),
++    )
++    assert on.rollout.use_score_centering is True
++    off = PPOConfig(
++        rollout=InferenceEngineConfig(backend="vllm:d1"),
++        gconfig=GenerationHyperparameters(score_centering_top_k=2),
++    )
++    assert off.rollout.use_score_centering is False
++
++
++def _rs(upper=5.0):
++    return RejectionSamplingConfig(action="clamp", upper=upper)
++
++
++def test_score_centering_rejects_importance_sampling():
++    """SC never reads importance_sampling."""
++    with pytest.raises(ValueError, match="does not read importance_sampling"):
++        PPOActorConfig(
++            backend="fsdp:d1",
++            use_score_centering=True,
++            rejection_sampling=_rs(),
++            importance_sampling=_rs(),
++        )
++
++
++def test_rejection_sampling_warning_survives_score_centering(monkeypatch):
++    """SC reads rejection_sampling for the TIS cap, so it must not be warned away."""
++    import areal.api.cli_args as cli_args_module
++
++    warnings: list[str] = []
++    monkeypatch.setattr(
++        cli_args_module.logger,
++        "warning",
++        lambda message, *a, **k: warnings.append(message),
++    )
++
++    PPOActorConfig(
++        backend="fsdp:d1", use_score_centering=True, rejection_sampling=_rs()
++    )
++    assert not any("Filtering will be ignored" in w for w in warnings)
++
++    warnings.clear()
++    PPOActorConfig(backend="fsdp:d1", rejection_sampling=_rs())
++    assert any("Filtering will be ignored" in w for w in warnings)
++
++
++def test_plan_b_help_matches_the_enforced_contract():
++    """The help must not promise a config the loader rejects."""
++    help_text = PPOActorConfig.__dataclass_fields__["sc_loss_mode"].metadata["help"]
++    assert "Both plans require" in help_text
++    assert "recompute_logprob=False" in help_text
++    assert "recompute_logprob=true" not in help_text
++
++
++def test_plan_b_loads_only_without_recompute_logprob():
++    """Plan B is loadable with the enforced contract, and only with it."""
++    PPOActorConfig(
++        backend="fsdp:d1",
++        use_score_centering=True,
++        sc_loss_mode="ppo_additive",
++        recompute_logprob=False,
++    )
++    with pytest.raises(ValueError, match="recompute_logprob=False"):
++        PPOActorConfig(
++            backend="fsdp:d1",
++            use_score_centering=True,
++            sc_loss_mode="ppo_additive",
++            recompute_logprob=True,
++        )
++
++
++def test_token_to_id_accepts_only_known_forms():
++    """Both sampler key shapes resolve; ambiguous text and negative ids do not."""
++    assert _token_to_id(42) == 42
++    assert _token_to_id("token:7") == 7
++    assert _token_to_id("token_id:7") == 7
++    assert _token_to_id("step:12") is None
++    assert _token_to_id(-3) is None
++    assert _token_to_id(None) is None
++    assert _token_to_id(True) is None
++
++
++@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.5])
++def test_parser_rejects_invalid_log_probs(bad):
++    """A sampler log-prob must be finite and non-positive."""
++    with pytest.raises(ValueError, match="finite and <= 0"):
++        _parse_top_logprobs({"token:1": bad})
++
++
++def test_parser_rejects_duplicate_token_ids():
++    """The same token twice in one row would double its probability mass."""
++    row = [
++        {"token_id": 1, "logprob": -0.5},
++        {"token_id": 1, "logprob": -0.6},
++    ]
++    with pytest.raises(ValueError, match="duplicate token id"):
++        _parse_top_logprobs(row)
++
++
++def test_head_width_must_agree_across_config_blocks():
++    """rollout.score_centering_top_k is auto-filled from gconfig."""
++    cfg = PPOConfig(
++        actor=PPOActorConfig(backend="fsdp:d1", use_score_centering=True),
++        gconfig=GenerationHyperparameters(score_centering_top_k=8),
++        rollout=InferenceEngineConfig(backend="vllm:d1p1t1", score_centering_top_k=0),
++    )
++    assert cfg.rollout.score_centering_top_k == 8
++
++
++def test_head_alignment_rejects_a_dropped_chunk():
++    """A chunk that loses its top-k rows must fail instead of shifting heads."""
++    validate_head_alignment(5, 5, 5)
++    with pytest.raises(ValueError, match="misaligned with the generated tokens"):
++        validate_head_alignment(4, 5, 5)
++
++
++def test_zero_mass_row_count_flags_all_neg_inf_rows():
++    """Rows carrying no sampler mass are counted so the engine can warn."""
++    assert zero_mass_row_count([[-0.5, -1.0], [NEG_INF_PAD, NEG_INF_PAD]]) == 1
++    assert zero_mass_row_count([[]]) == 1
++    assert zero_mass_row_count([[-0.5]]) == 0
++
++
++def test_routed_experts_shares_the_token_payload_axis():
++    """routed_experts is trimmed on the token axis exactly like the sampler heads."""
++    assert "routed_experts" in _TOKEN_PAYLOAD_KEYS
++    assert "sampler_head_ids" in _TOKEN_PAYLOAD_KEYS
++    assert "sampler_head_logprobs" in _TOKEN_PAYLOAD_KEYS
 diff --git a/tests/test_score_centering_objective.py b/tests/test_score_centering_objective.py
 new file mode 100644
 index 0000000..bd8ed5c
@@ -643,10 +826,10 @@ index 0000000..bd8ed5c
 +        _call(logprobs, data, use_score_centering=True, sc_correction=None)
 diff --git a/tests/test_score_centering_pipeline.py b/tests/test_score_centering_pipeline.py
 new file mode 100644
-index 0000000..549fa20
+index 0000000..c00ddd5
 --- /dev/null
 +++ b/tests/test_score_centering_pipeline.py
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,332 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +"""End-to-end sampler top-k positioning: parser, assembly, shift and packing."""
@@ -752,10 +935,12 @@ index 0000000..549fa20
 +        model_response=model_response,
 +    ).to_tensor_dict()
 +    assert capped["sampler_head_ids"].shape == (1, 5, 2)
-+    # The cap keeps the first score_centering_top_k raw entries (sampled token first), so
-+    # per-position ordering, not a re-sorted top-k, survives the truncation.
-+    assert capped["sampler_head_ids"][0, 2].tolist() == [5, 2]
-+    assert capped["sampler_head_logprobs"][0, 2, 0].item() == -3.0
++    # Sorting by logprob then capping keeps the true top-2: the injected entry has
++    # logprob -3.0, so it loses its slot to id 2 (-0.4) and id 0 (-1.2).
++    assert capped["sampler_head_ids"][0, 2].tolist() == [2, 0]
++    assert capped["sampler_head_logprobs"][0, 2, 0].item() == pytest.approx(-0.4)
++    # A width > k row is re-sorted by logprob and cut to k; a width == k row is
++    # untouched.
 +    assert capped["sampler_head_ids"][0, 3].tolist() == POSITION_TOKEN_SETS[1]
 +
 +    short = ModelResponse(
@@ -929,6 +1114,54 @@ index 0000000..549fa20
 +    response = VLLMBackend().parse_generation_response(raw)
 +    assert response.sampler_head_ids is None
 +    assert response.sampler_head_logprobs is None
++
++
++def test_parser_raises_when_no_position_carries_a_token_id():
++    """A schema without token ids must name the schema, not max_logprobs."""
++    raw = {
++        "choices": [
++            {
++                "finish_reason": "stop",
++                "token_ids": [21],
++                "logprobs": {
++                    "content": [{"logprob": -0.4}],
++                    "top_logprobs": [{"hello": -0.4, "world": -1.0}],
++                },
++            }
++        ]
++    }
++    with pytest.raises(ValueError, match="resolvable token id"):
++        VLLMBackend().parse_generation_response(raw)
++
++
++def test_truncate_topk_sorts_then_caps_and_is_a_noop_at_width_k():
++    """The shared cap sorts by logprob and leaves an exactly-k row untouched."""
++    from areal.utils.topk_padding import truncate_topk
++
++    assert truncate_topk([5, 2, 0], [-3.0, -0.4, -1.2], 2) == ([2, 0], [-0.4, -1.2])
++    assert truncate_topk([2, 0], [-0.4, -1.2], 2) == ([2, 0], [-0.4, -1.2])
++    assert truncate_topk([], [], 2) == ([], [])
++    with pytest.raises(ValueError, match="misaligned"):
++        truncate_topk([1, 2], [-0.4], 1)
++
++
++def test_width_k_plus_one_keeps_the_true_kth_and_drops_the_sampled_token():
++    """With k + 1 entries the sampled token can lose its slot to the true k-th."""
++    _, model_response = _parsed_response()
++    # Row 0 becomes [5, 2, 0] / [-3.0, -0.4, -1.2]: the sampled token (5) carries
++    # the worst logprob, so a [:k] arrival-order cap would keep it and drop id 0.
++    model_response.sampler_head_ids[0] = [5, 2, 0]
++    model_response.sampler_head_logprobs[0] = [-3.0, -0.4, -1.2]
++    capped = InteractionWithTokenLogpReward(
++        score_centering_top_k=2,
++        reward=0.0,
++        model_response=model_response,
++    ).to_tensor_dict()
++
++    row = capped["sampler_head_ids"][0, 2].tolist()
++    assert row == [2, 0]  # the true k-th entry (id 0, -1.2) is kept
++    assert 5 not in row  # the sampled token is squeezed out, not kept by arrival
++    assert capped["sampler_head_logprobs"][0, 2].tolist() == pytest.approx([-0.4, -1.2])
 diff --git a/tests/test_score_centering_tis.py b/tests/test_score_centering_tis.py
 new file mode 100644
 index 0000000..325def9
