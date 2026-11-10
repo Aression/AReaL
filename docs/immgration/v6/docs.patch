@@ -1,8 +1,10 @@
 diff --git a/docs/en/cli_reference.md b/docs/en/cli_reference.md
-index 88d2d64..7bb2321 100644
+index 88d2d644..7bb2321e 100644
 --- a/docs/en/cli_reference.md
 +++ b/docs/en/cli_reference.md
-@@ -424,2 +424,8 @@ Configuration for PPO actor model, a subclass of a TrainEngine.
+@@ -422,6 +422,12 @@ Configuration for PPO actor model, a subclass of a TrainEngine.
+ | `prox_logp_method`          | string                                                          | `"recompute"`         | Method for computing proximal policy log-probabilities in decoupled PPO. Only effective when use_decoupled_loss=True. Options: 'recompute' (default): Standard decoupled PPO, recompute proximal policy via forward pass. 'reuse': Reuse detached log-probabilities from the current training forward pass; requires use_decoupled_loss=True and ppo_n_minibatches=1. 'loglinear': Use log-linear interpolation to approximate proximal policy (skip forward pass). 'metrics': Like 'recompute', but also compute approximation metrics for evaluation. **Choices:** `recompute`, `reuse`, `loglinear`, `metrics`                                                                                           |
+ | `loss_aggregation`          | string                                                          | `"token-mean"`        | Policy-gradient loss reduction. 'token-mean': average over valid tokens. 'seq-mean': average per-response token means. 'traj-mean': average per-trajectory token means, so an agent rollout exported as several rows still counts once. 'prompt-mean': give every rollout group weight one and pool its tokens, so a longer rollout weighs more inside its group. Prompt boundaries come from rollout batch metadata. 'constant': average each response's masked token sum divided by loss_aggregation_divisor. Non-token modes require sequence boundaries; tree-packed actor training currently supports only 'token-mean'. **Choices:** `token-mean`, `seq-mean`, `traj-mean`, `prompt-mean`, `constant` |
  | `loss_aggregation_divisor`  | float \| None                                                   | `None`                | Positive fixed denominator L for loss_aggregation='constant'. Unused by other loss aggregation modes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 +| `use_score_centering`       | boolean                                                         | `False`               | Enable Score Centering (SC) additive drift correction. When True, requires sampler top-k logprobs in input_data.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 +| `sc_reinforce_baseline`     | boolean                                                         | `False`               | When True, use pure REINFORCE (-A·log p(a)) as the baseline loss for SC-off comparisons, instead of PPO clipped surrogate. This enables a fair A1 ablation: SC-on and SC-off both use REINFORCE (no PPO ratio), so the difference is the SC correction term. Only valid when use_score_centering=False; combining both raises at load time.                                                                                                                                                                                                                                                                                                                                                                 |
@@ -11,7 +13,11 @@ index 88d2d64..7bb2321 100644
 +| `sc_clip_low`               | float                                                           | `0.5`                 | Lower bound of the sampled-token ratio band for sc_mode='tis' and sc_mode='mis'. Default 0.5.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 +| `sc_clip_high`              | float                                                           | `5.0`                 | Upper bound of the sampled-token ratio band for sc_mode='tis' and sc_mode='mis'. Default 5.0.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
  | `log_agent_stats`           | boolean                                                         | `False`               | Log statistics for agent trajectories                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-@@ -535,19 +541,20 @@ Controls text generation behavior for rollout.
+ | `log_agent_stats_keys`      | list of string                                                  | **Required**          | Keys for logging agent trajectory statistics                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+ | `max_new_tokens`            | integer                                                         | `1024`                | Maximum number of new tokens to generate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+@@ -533,23 +539,24 @@ Core configuration for model training, including optimization and backend settin
+ 
+ Controls text generation behavior for rollout.
  
 -| Parameter             | Type                   | Default          | Description                                                                                                                           |
 -| --------------------- | ---------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
@@ -49,12 +55,20 @@ index 88d2d64..7bb2321 100644
 +| `lora_name`             | string                 | `"default_lora"` | Lora name to be used for this generation.                                                                                                                                        |
 +| `use_beam_search`       | boolean                | `False`          | Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored.                                                    |
  
-@@ -584,2 +591,4 @@ Configuration for inference servers, including offpolicyness control.
+ (section-inference-engine)=
+ 
+@@ -582,6 +589,8 @@ Configuration for inference servers, including offpolicyness control.
+ | `scheduling_strategy`      | [`SchedulingStrategy`](section-scheduling-strategy) | **Required**        | The scheduling strategy of this InferenceEngine, either separation or colocation. Currently only used by the RolloutController.                                                                                                                                                                                                                                                                                                                         |
+ | `use_lora`                 | boolean                                             | `False`             | Whether to use LoRA. Should be same as actors LORA option.                                                                                                                                                                                                                                                                                                                                                                                              |
  | `lora_name`                | string                                              | `""`                | LoRA adapter name the rollout backend serves. Generation requests select the adapter by this name (plus the weight version). Usually left empty and auto-filled from gconfig.lora_name by PPOConfig.__post_init__ so load and request sides stay in sync.                                                                                                                                                                                               |
 +| `score_centering_top_k`    | integer                                             | `0`                 | Score Centering: number of top-k logprobs to request from the vLLM sampler. Auto-filled from gconfig.score_centering_top_k by PPOConfig.__post_init__. 0 = disabled (no top-k logprobs).                                                                                                                                                                                                                                                                |
 +| `use_score_centering`      | boolean                                             | `False`             | Mirror of actor.use_score_centering, filled by PPOConfig.__post_init__. The rollout worker uses it to tell 'heads were requested and are required' (SC on) from 'heads were requested but nobody consumes them' (SC off with a leftover score_centering_top_k), so a headless rollout only aborts when the trainer would actually need the heads.                                                                                                       |
  | `agent`                    | [`AgentConfig`](section-agent)                      | **Required**        | Agent workflow configuration used by inference-service rollouts.                                                                                                                                                                                                                                                                                                                                                                                        |
-@@ -667,36 +676,37 @@ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
+ | `return_routed_experts`    | boolean                                             | `False`             | Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models.                                                                                                                                                                                                                                                                                                                                                   |
+ | `_version`                 | string                                              | `"v1"`              | Rollout controller implementation version. Use 'v1' for legacy RolloutController, 'v2' for RolloutControllerV2. **Choices:** `v1`, `v2`                                                                                                                                                                                                                                                                                                                 |
+@@ -665,40 +674,41 @@ Configuration for vLLM runtime. Refer to:
+ 
+ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
  
 -| Parameter                      | Type                   | Default                                                             | Description                                                                             |
 -| ------------------------------ | ---------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
@@ -126,16 +140,24 @@ index 88d2d64..7bb2321 100644
 +| `speculative_config`           | `dict` \| None         | `None`                                                              | -                                                                                                                |
 +| `no_async_scheduling`          | boolean                | `False`                                                             | -                                                                                                                |
  
-@@ -1327,3 +1337,3 @@ Attributes:
+ (section-train-dataset)=
+ 
+@@ -1325,7 +1335,7 @@ Attributes:
+ | `metric`  | string        | `"ratio"` | Divergence metric for filtering. 'ratio': direct importance ratio π_proximal/π_behave. 'kl_k1': KL estimator k1 = log(r), forward KL unbiased estimator (can be negative). 'kl_k2': KL estimator k2 = 0.5 * (log r)^2, non-negative quadratic approximation. 'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator. 'binary_kl': KPop (symmetric binary KL divergence) — masks tokens where either KL(proximal |
+ | `agg`     | string        | `"mean"`  | Aggregation method for sequence-level filtering. Only used when level='sequence'. For 'ratio' metric, aggregation is in log space: 'sum' = exp(sum(log(r_i))), 'mean' = exp(mean(log(r_i))) = geometric mean (length-invariant, consistent with GSPO). For KL metrics, aggregation is arithmetic: 'sum' = sum(kl_i), 'mean' = mean(kl_i). 'max': max of per-token metric values (most conservative). **Choices:** `sum`, `mean`, `max`      |
  | `upper`   | float         | `5.0`     | Upper bound for filtering. Tokens/sequences with metric > upper are filtered out (loss_mask zeroed). For 'ratio' metric: must be > 1.0, typical values are 2.0 or 5.0. For 'kl_k2'/'kl_k3' metrics: typical values are 0.5-2.0.                                                                                                                                                                                                             |
 -| `lower`   | float \| None | `None`    | Lower bound for filtering (optional). None means no lower bound. For 'ratio' metric: typical value is 0.5 (filter out tokens where policy probability dropped significantly). Must be > 0. For 'kl_k1' metric: can be used to filter negative KL estimates.                                                                                                                                                                                 |
 +| `lower`   | float \| None | `None`    | Lower bound for filtering (optional). None means no lower bound. For 'ratio' metric: typical value is 0.5 (filter out tokens where policy probability dropped significantly). Must be > 0, except with action='clamp' where a zero floor is allowed. For 'kl_k1' metric: can be used to filter negative KL estimates.                                                                                                                       |
+ 
+ (section-scheduler)=
  
 diff --git a/docs/zh/cli_reference.md b/docs/zh/cli_reference.md
-index eb25d3a..fc7044c 100644
+index eb25d3a2..fc7044c4 100644
 --- a/docs/zh/cli_reference.md
 +++ b/docs/zh/cli_reference.md
-@@ -422,2 +422,8 @@ Configuration for PPO actor model, a subclass of a TrainEngine.
+@@ -420,6 +420,12 @@ Configuration for PPO actor model, a subclass of a TrainEngine.
+ | `prox_logp_method`          | string                                                          | `"recompute"`         | Method for computing proximal policy log-probabilities in decoupled PPO. Only effective when use_decoupled_loss=True. Options: 'recompute' (default): Standard decoupled PPO, recompute proximal policy via forward pass. 'reuse': Reuse detached log-probabilities from the current training forward pass; requires use_decoupled_loss=True and ppo_n_minibatches=1. 'loglinear': Use log-linear interpolation to approximate proximal policy (skip forward pass). 'metrics': Like 'recompute', but also compute approximation metrics for evaluation. **Choices:** `recompute`, `reuse`, `loglinear`, `metrics`                                                                                           |
+ | `loss_aggregation`          | string                                                          | `"token-mean"`        | Policy-gradient loss reduction. 'token-mean': average over valid tokens. 'seq-mean': average per-response token means. 'traj-mean': average per-trajectory token means, so an agent rollout exported as several rows still counts once. 'prompt-mean': give every rollout group weight one and pool its tokens, so a longer rollout weighs more inside its group. Prompt boundaries come from rollout batch metadata. 'constant': average each response's masked token sum divided by loss_aggregation_divisor. Non-token modes require sequence boundaries; tree-packed actor training currently supports only 'token-mean'. **Choices:** `token-mean`, `seq-mean`, `traj-mean`, `prompt-mean`, `constant` |
  | `loss_aggregation_divisor`  | float \| None                                                   | `None`                | Positive fixed denominator L for loss_aggregation='constant'. Unused by other loss aggregation modes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 +| `use_score_centering`       | boolean                                                         | `False`               | Enable Score Centering (SC) additive drift correction. When True, requires sampler top-k logprobs in input_data.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 +| `sc_reinforce_baseline`     | boolean                                                         | `False`               | When True, use pure REINFORCE (-A·log p(a)) as the baseline loss for SC-off comparisons, instead of PPO clipped surrogate. This enables a fair A1 ablation: SC-on and SC-off both use REINFORCE (no PPO ratio), so the difference is the SC correction term. Only valid when use_score_centering=False; combining both raises at load time.                                                                                                                                                                                                                                                                                                                                                                 |
@@ -144,7 +166,11 @@ index eb25d3a..fc7044c 100644
 +| `sc_clip_low`               | float                                                           | `0.5`                 | Lower bound of the sampled-token ratio band for sc_mode='tis' and sc_mode='mis'. Default 0.5.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 +| `sc_clip_high`              | float                                                           | `5.0`                 | Upper bound of the sampled-token ratio band for sc_mode='tis' and sc_mode='mis'. Default 5.0.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
  | `log_agent_stats`           | boolean                                                         | `False`               | Log statistics for agent trajectories                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-@@ -533,19 +539,20 @@ Controls text generation behavior for rollout.
+ | `log_agent_stats_keys`      | list of string                                                  | **Required**          | Keys for logging agent trajectory statistics                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+ | `max_new_tokens`            | integer                                                         | `1024`                | Maximum number of new tokens to generate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+@@ -531,23 +537,24 @@ Core configuration for model training, including optimization and backend settin
+ 
+ Controls text generation behavior for rollout.
  
 -| Parameter             | Type                   | Default          | Description                                                                                                                           |
 -| --------------------- | ---------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
@@ -182,12 +208,20 @@ index eb25d3a..fc7044c 100644
 +| `lora_name`             | string                 | `"default_lora"` | Lora name to be used for this generation.                                                                                                                                        |
 +| `use_beam_search`       | boolean                | `False`          | Enable beam search in the vLLM engine. When enabled, sampling parameters like temperature, top-p, and top-k are auto ignored.                                                    |
  
-@@ -582,2 +589,4 @@ Configuration for inference servers, including offpolicyness control.
+ (section-inference-engine)=
+ 
+@@ -580,6 +587,8 @@ Configuration for inference servers, including offpolicyness control.
+ | `scheduling_strategy`      | [`SchedulingStrategy`](section-scheduling-strategy) | **Required**        | The scheduling strategy of this InferenceEngine, either separation or colocation. Currently only used by the RolloutController.                                                                                                                                                                                                                                                                                                                         |
+ | `use_lora`                 | boolean                                             | `False`             | Whether to use LoRA. Should be same as actors LORA option.                                                                                                                                                                                                                                                                                                                                                                                              |
  | `lora_name`                | string                                              | `""`                | LoRA adapter name the rollout backend serves. Generation requests select the adapter by this name (plus the weight version). Usually left empty and auto-filled from gconfig.lora_name by PPOConfig.__post_init__ so load and request sides stay in sync.                                                                                                                                                                                               |
 +| `score_centering_top_k`    | integer                                             | `0`                 | Score Centering: number of top-k logprobs to request from the vLLM sampler. Auto-filled from gconfig.score_centering_top_k by PPOConfig.__post_init__. 0 = disabled (no top-k logprobs).                                                                                                                                                                                                                                                                |
 +| `use_score_centering`      | boolean                                             | `False`             | Mirror of actor.use_score_centering, filled by PPOConfig.__post_init__. The rollout worker uses it to tell 'heads were requested and are required' (SC on) from 'heads were requested but nobody consumes them' (SC off with a leftover score_centering_top_k), so a headless rollout only aborts when the trainer would actually need the heads.                                                                                                       |
  | `agent`                    | [`AgentConfig`](section-agent)                      | **Required**        | Agent workflow configuration used by inference-service rollouts.                                                                                                                                                                                                                                                                                                                                                                                        |
-@@ -665,36 +674,37 @@ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
+ | `return_routed_experts`    | boolean                                             | `False`             | Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models.                                                                                                                                                                                                                                                                                                                                                   |
+ | `_version`                 | string                                              | `"v1"`              | Rollout controller implementation version. Use 'v1' for legacy RolloutController, 'v2' for RolloutControllerV2. **Choices:** `v1`, `v2`                                                                                                                                                                                                                                                                                                                 |
+@@ -663,40 +672,41 @@ Configuration for vLLM runtime. Refer to:
+ 
+ https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
  
 -| Parameter                      | Type                   | Default                                                             | Description                                                                             |
 -| ------------------------------ | ---------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
@@ -259,16 +293,24 @@ index eb25d3a..fc7044c 100644
 +| `speculative_config`           | `dict` \| None         | `None`                                                              | -                                                                                                                |
 +| `no_async_scheduling`          | boolean                | `False`                                                             | -                                                                                                                |
  
-@@ -1325,3 +1335,3 @@ Attributes:
+ (section-train-dataset)=
+ 
+@@ -1323,7 +1333,7 @@ Attributes:
+ | `metric`  | string        | `"ratio"` | Divergence metric for filtering. 'ratio': direct importance ratio π_proximal/π_behave. 'kl_k1': KL estimator k1 = log(r), forward KL unbiased estimator (can be negative). 'kl_k2': KL estimator k2 = 0.5 * (log r)^2, non-negative quadratic approximation. 'kl_k3': KL estimator k3 = r - log(r) - 1, non-negative exact forward KL estimator. 'binary_kl': KPop (symmetric binary KL divergence) — masks tokens where either KL(proximal |
+ | `agg`     | string        | `"mean"`  | Aggregation method for sequence-level filtering. Only used when level='sequence'. For 'ratio' metric, aggregation is in log space: 'sum' = exp(sum(log(r_i))), 'mean' = exp(mean(log(r_i))) = geometric mean (length-invariant, consistent with GSPO). For KL metrics, aggregation is arithmetic: 'sum' = sum(kl_i), 'mean' = mean(kl_i). 'max': max of per-token metric values (most conservative). **Choices:** `sum`, `mean`, `max`      |
  | `upper`   | float         | `5.0`     | Upper bound for filtering. Tokens/sequences with metric > upper are filtered out (loss_mask zeroed). For 'ratio' metric: must be > 1.0, typical values are 2.0 or 5.0. For 'kl_k2'/'kl_k3' metrics: typical values are 0.5-2.0.                                                                                                                                                                                                             |
 -| `lower`   | float \| None | `None`    | Lower bound for filtering (optional). None means no lower bound. For 'ratio' metric: typical value is 0.5 (filter out tokens where policy probability dropped significantly). Must be > 0. For 'kl_k1' metric: can be used to filter negative KL estimates.                                                                                                                                                                                 |
 +| `lower`   | float \| None | `None`    | Lower bound for filtering (optional). None means no lower bound. For 'ratio' metric: typical value is 0.5 (filter out tokens where policy probability dropped significantly). Must be > 0, except with action='clamp' where a zero floor is allowed. For 'kl_k1' metric: can be used to filter negative KL estimates.                                                                                                                       |
  
+ (section-scheduler)=
+ 
 diff --git a/examples/math/README.md b/examples/math/README.md
-index 4c5d5eb..e03716b 100644
+index 4c5d5ebc..04bac81d 100644
 --- a/examples/math/README.md
 +++ b/examples/math/README.md
-@@ -36 +36,55 @@ be used directly with the AWEX sample yaml. Auto-start is only available in
+@@ -34,3 +34,58 @@ Awex meta server bootstrap is now handled by `PPOTrainer` when
+ `actor.weight_update_mode=awex`; the standard `examples/math/gsm8k_rl.py` entrypoint can
+ be used directly with the AWEX sample yaml. Auto-start is only available in
  single-controller mode; SPMD runs must provide an explicit `awex.meta_server_addr`.
 +
 +## Score centering with vLLM
@@ -292,35 +334,36 @@ index 4c5d5eb..e03716b 100644
 +```
 +
 +Enabling score centering selects token-wise REINFORCE with a detached head/tail
-+correction, replacing the clipped PPO surrogate. With `actor.rejection_sampling=null`
-+the sampled term stays unweighted. Token-level truncated importance sampling (TIS)
-+reuses
-+AReaL's existing `rejection_sampling` configuration — no new YAML knob:
++correction, replacing the clipped PPO surrogate. Score centering owns its head
++weighting, so `actor.rejection_sampling` and `actor.importance_sampling` must stay
++`null`; `sc_mode` selects the weight function applied to the sampled-token ratio `p/q`
++and to the tail mass ratio:
 +
 +```yaml
 +actor:
 +  use_score_centering: true
 +  recompute_logprob: false
 +  use_decoupled_loss: false
-+  rejection_sampling:
-+    level: token
-+    metric: ratio
-+    action: clamp
-+    upper: 2.0
-+    lower: null
++  rejection_sampling: null
++  importance_sampling: null
++  sc_mode: tis            # none (default) | tis | mis
++  sc_clip_low: 0.0        # lower band bound; 0 disables the lower clamp
++  sc_clip_high: 2.0       # upper bound, must be finite for tis/mis
 +```
 +
-+The sampled term uses `min(p/q, upper)` from the sampler log-probabilities; the
-+correction already carries its own head/tail weights and is not multiplied by them
-+again.
-+Sequence-level rejection, masking, KL metrics and positive lower bounds are unsupported,
-+and `upper` must be finite, greater than one and representable in FP32.
++- `none` leaves the head weight at one: pure centering.
++- `tis` clips the ratio into `[sc_clip_low, sc_clip_high]`.
++- `mis` keeps the ratio inside that band and zeroes it outside.
++
++`tis` requires `0 <= sc_clip_low < sc_clip_high` with a finite upper bound; `mis`
++additionally requires `sc_clip_high > 0`. The correction carries the matching head/tail
++weights, so the sampled term is not weighted twice. Diagnostics are exported as
++`sc_correction`, `sc_loss_term`, `sc_tis_weight`, `sc_tis_clamped_fraction`, `sc_rho`,
++`sc_q_mass` and `sc_p_mass`.
 +
 +Support requires the vLLM rollout backend, temperature 1, untruncated sampling and no
 +penalties. On this backend score centering additionally requires full-vocab,
-+full-sequence
-+trainer logits, so tensor parallel with a vocabulary-sharded LM head and Ulysses/context
-+parallel fail fast. SAPO/CISPO, decoupled PPO, tree training and distillation remain
-+unsupported, and `score_centering_top_k` never reaches the OpenAI SDK (the proxy
-+consumes
-+it).
++full-sequence trainer logits, so tensor parallel with a vocabulary-sharded LM head and
++Ulysses/context parallel fail fast. SAPO/CISPO, decoupled PPO, tree training and
++distillation remain unsupported, and `score_centering_top_k` never reaches the OpenAI
++SDK (the proxy consumes it).
