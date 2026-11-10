@@ -34,3 +34,53 @@ Awex meta server bootstrap is now handled by `PPOTrainer` when
 `actor.weight_update_mode=awex`; the standard `examples/math/gsm8k_rl.py` entrypoint can
 be used directly with the AWEX sample yaml. Auto-start is only available in
 single-controller mode; SPMD runs must provide an explicit `awex.meta_server_addr`.
+
+## Score centering with vLLM
+
+Score centering subtracts an estimate of the sampler-expected score from the policy
+gradient, so training survives the drift between the vLLM sampler and the FSDP learner.
+This branch carries the sampler's top-k token ids and log-probabilities through the
+**OpenAI agent transport** (`ArealOpenAI` proxy), which is how `gsm8k_rl.py` drives
+rollouts here; the native SGLang metadata path is not used on this backend.
+
+Start from an existing recipe with these overrides, and set model paths, resource
+allocation and output directories for your environment:
+
+```bash
+python3 examples/math/gsm8k_rl.py \
+  --config examples/math/gsm8k_grpo_npu.yaml scheduler.type=local \
+  actor.use_score_centering=true actor.recompute_logprob=false \
+  actor.use_decoupled_loss=false actor.rejection_sampling=null \
+  gconfig.score_centering_top_k=128 gconfig.top_k=-1 gconfig.top_p=1.0 \
+  gconfig.temperature=1.0
+```
+
+Enabling score centering selects token-wise REINFORCE with a detached head/tail
+correction, replacing the clipped PPO surrogate. With `actor.rejection_sampling=null`
+the sampled term stays unweighted. Token-level truncated importance sampling (TIS)
+reuses AReaL's existing `rejection_sampling` configuration — no new YAML knob:
+
+```yaml
+actor:
+  use_score_centering: true
+  recompute_logprob: false
+  use_decoupled_loss: false
+  rejection_sampling:
+    level: token
+    metric: ratio
+    action: clamp
+    upper: 2.0
+    lower: null
+```
+
+The sampled term uses `min(p/q, upper)` from the sampler log-probabilities; the
+correction already carries its own head/tail weights and is not multiplied by them
+again. Sequence-level rejection, masking, KL metrics and positive lower bounds are
+unsupported, and `upper` must be finite, greater than one and representable in FP32.
+
+Support requires the vLLM rollout backend, temperature 1, untruncated sampling and no
+penalties. On this backend score centering additionally requires full-vocab,
+full-sequence trainer logits, so tensor parallel with a vocabulary-sharded LM head and
+Ulysses/context parallel fail fast. SAPO/CISPO, decoupled PPO, tree training and
+distillation remain unsupported, and `score_centering_top_k` never reaches the OpenAI
+SDK (the proxy consumes it).
