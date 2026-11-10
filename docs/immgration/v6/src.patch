@@ -778,12 +778,12 @@ index 779da22..fc29e48 100644
 +            else None,
          )
 diff --git a/areal/trainer/ppo/actor.py b/areal/trainer/ppo/actor.py
-index d649cab..c9461de 100644
+index d649cab..09a9562 100644
 --- a/areal/trainer/ppo/actor.py
 +++ b/areal/trainer/ppo/actor.py
 @@ -46,2 +46,3 @@ from areal.utils.functional.loss_aggregation import PolicyGradientReduction
  from areal.utils.perf_tracer import trace_perf
-+from areal.utils.score_centering import build_weight_fn, sampled_weight
++from areal.utils.score_centering import band_mask, build_weight_fn, sampled_weight
  from areal.utils.stats_tracker import ReduceType
 @@ -258,2 +259,3 @@ class PPOActor:
          else:
@@ -810,23 +810,29 @@ index d649cab..c9461de 100644
 +                    self.config.sc_clip_high,
 +                )
              for mb, loss_step in zip(mb_inputs, loss_steps, strict=True):
-@@ -495,2 +512,6 @@ class PPOActor:
+@@ -495,2 +512,11 @@ class PPOActor:
                          pg_reduction=loss_step,
 +                        use_score_centering=self.config.use_score_centering,
 +                        sc_reinforce_baseline=self.config.sc_reinforce_baseline,
 +                        sc_loss_mode=self.config.sc_loss_mode,
 +                        sc_weight_fn=sc_weight_fn,
++                        sc_band=(
++                            (self.config.sc_clip_low, self.config.sc_clip_high)
++                            if self.config.sc_mode != "none"
++                            else None
++                        ),
                      ),
-@@ -651,2 +672,8 @@ def grpo_loss_fn(
+@@ -651,2 +677,9 @@ def grpo_loss_fn(
      vocab_norm_logits: torch.Tensor | None = None,
 +    use_score_centering: bool = False,
 +    sc_correction: torch.Tensor | None = None,
 +    sc_reinforce_baseline: bool = False,
 +    sc_loss_mode: str = "reinforce",
 +    sc_weight_fn=None,
++    sc_band: tuple[float, float] | None = None,
 +    sc_metrics: dict | None = None,
  ):
-@@ -738,4 +765,96 @@ def grpo_loss_fn(
+@@ -738,4 +771,96 @@ def grpo_loss_fn(
  
 +    # SC: Plan A = REINFORCE + SC (default), Plan B = PPO surrogate + SC additive.
 +    sc_loss = None
@@ -923,12 +929,12 @@ index d649cab..c9461de 100644
 +            "distillation branch would replace the REINFORCE+SC objective."
 +        )
      rkl_stat = None
-@@ -849,3 +968,3 @@ def grpo_loss_fn(
+@@ -849,3 +974,3 @@ def grpo_loss_fn(
          entropy=entropy.float(),
 -        actor_loss=stat["loss"],
 +        actor_loss=stat["loss"] if not sc_loss_overridden else combined.detach(),
          clip_ratio=stat["clip_mask"].float(),
-@@ -854,2 +973,16 @@ def grpo_loss_fn(
+@@ -854,2 +979,16 @@ def grpo_loss_fn(
      )
 +    # The scalar tracker accepts numbers only. Dashboard loss-mode codes:
 +    # 0 = PPO, 1 = REINFORCE + SC, 2 = REINFORCE baseline, 3 = PPO + SC.
@@ -945,7 +951,7 @@ index d649cab..c9461de 100644
 +        # 1 when the correction was applied this step, 0 when SC was skipped.
 +        stats_tracker.scalar(sc_active=1 if sc_correction is not None else 0)
      if "behave_imp_weight" in stat:
-@@ -904,2 +1037,35 @@ def grpo_loss_fn(
+@@ -904,2 +1043,38 @@ def grpo_loss_fn(
  
 +    # Score centering reports the correction itself plus the weight/head-mass
 +    # diagnostics that explain it.
@@ -965,9 +971,12 @@ index d649cab..c9461de 100644
 +                denominator="n_valid_tokens",
 +                reduce_type=ReduceType.AVG_MIN_MAX,
 +            )
-+        if sc_raw_ratio is not None:
++        # Only a band-limited weight can clamp anything; with mode="none" the
++        # ratio is untouched and the fraction is not reported.
++        if sc_raw_ratio is not None and sc_band is not None:
++            inside = band_mask(sc_raw_ratio, *sc_band)
 +            stats_tracker.stat(
-+                sc_tis_clamped_fraction=(sc_weight != sc_raw_ratio).float(),
++                sc_tis_clamped_fraction=(~inside).float(),
 +                denominator="n_valid_tokens",
 +                reduce_type=ReduceType.AVG,
 +            )
@@ -1081,10 +1090,10 @@ index c705ab7..30459ed 100644
          elif key == "position_ids":
 diff --git a/areal/utils/score_centering.py b/areal/utils/score_centering.py
 new file mode 100644
-index 0000000..281de9d
+index 0000000..3359846
 --- /dev/null
 +++ b/areal/utils/score_centering.py
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,336 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Head/tail score centering with ordinary PyTorch autograd.
 +
@@ -1410,6 +1419,11 @@ index 0000000..281de9d
 +        metrics_out["q_mass"] = q_mass
 +        metrics_out["p_mass"] = p_mass
 +    return selected[:, 0], entropy, correction
++
++
++def band_mask(ratio, low: float, high: float):
++    """True where *ratio* sits inside the band [low, high]."""
++    return (ratio >= low) & (ratio <= high)
 +
 +
 +def sampled_weight(train_logp, sampler_logp, weight_fn):
