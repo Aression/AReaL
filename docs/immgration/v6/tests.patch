@@ -1172,10 +1172,10 @@ index 0000000..c00ddd5
 +    assert capped["sampler_head_logprobs"][0, 2].tolist() == pytest.approx([-0.4, -1.2])
 diff --git a/tests/test_score_centering_tis.py b/tests/test_score_centering_tis.py
 new file mode 100644
-index 0000000..d512c93
+index 0000000..7b0246d
 --- /dev/null
 +++ b/tests/test_score_centering_tis.py
-@@ -0,0 +1,346 @@
+@@ -0,0 +1,355 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Head weighting for score centering: the none/tis/mis bands and the pad mask."""
 +
@@ -1522,3 +1522,12 @@ index 0000000..d512c93
 +    assert not config.use_score_centering
 +    assert config.sc_mode == "none"
 +    assert config.rejection_sampling.upper == 2.0
++
++def test_band_mask_marks_ratios_outside_the_clip_band():
++    """The clamped fraction is the share of ratios outside [low, high]."""
++    from areal.utils.score_centering import band_mask
++
++    ratio = torch.tensor([0.2, 0.5, 1.0, 2.0, 3.0])
++    inside = band_mask(ratio, 0.5, 2.0)
++    assert inside.tolist() == [False, True, True, True, False]
++    assert (~inside).float().mean().item() == pytest.approx(0.4)
