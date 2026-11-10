@@ -1,102 +1,8 @@
-From d75e47477ac36ca6ad9e2499ce058ea9a2930251 Mon Sep 17 00:00:00 2001
-From: Aression <lvdifine@gmail.com>
-Date: Fri, 6 Nov 2026 20:30:07 +0800
-Subject: [PATCH] feat(engine): score centering for the vLLM backend and the
- agent transport
-
-Add Score Centering (arXiv:2609.20807) to AReaL's vLLM rollout backend on
-Ascend, carrying the sampler's per-token top-k ids and log-probabilities through
-the OpenAI agent transport that `gsm8k_rl.py` uses here, and applying the
-additive drift correction in FSDP training.
-
-The calculation is the one merged on `main`: `areal/utils/score_centering.py` is
-byte-identical to upstream, the correction is computed engine-side and handed to
-the loss as a scalar, and token-level TIS reuses the existing
-`rejection_sampling` configuration with no new YAML knob.  What this commit adds
-on top:
-
-- a vLLM response parser that accepts both the <= 0.23 flat `top_logprobs`
-  layout and the >= 0.30 per-position nested layout (the Ascend images ship
-  0.30), plus the `max_logprobs` raise needed to request 128 alternatives;
-- head propagation through `ArealOpenAI` / `InteractionWithTokenLogpReward`, so
-  the agent transport carries the heads the way the native SGLang path does on
-  `main`;
-- two opt-in extensions for ablation runs: `sc_loss_mode` ("reinforce" = Plan A
-  default, "ppo_additive" = Plan B; a plain str because OmegaConf rejects Literal
-  annotations) and
-  `sc_reinforce_baseline` (pure REINFORCE while SC is off);
-- config guards that reject the combinations this transport cannot support:
-  non-FSDP actors, non-vLLM rollouts, tree training, tensor/context parallel,
-  temperature != 1, truncated or penalised sampling, distillation, and the other
-  policy surrogates (SAPO/CISPO/M2PO/decoupled PPO).  The documented
-  `score_centering_top_k` range is enforced by the upstream `validate_sampling`
-  helper at load time.
-
-Packed-sequence masking is a separate defect and ships in its own PR; this
-branch keeps the upstream mask handling.  TP/CP score centering is not part of
-this port either: the vLLM transport cannot hand the trainer sharded heads, so
-the engine rejects those layouts and the TP/CP test files are not carried over.
-
-Validation (Ascend 910B, CPU-level suites plus runtime smoke):
-
-- `tests/test_score_centering*.py` and the adjacent suites: 100 passed,
-  35 skipped, 1 xfailed.  The skips are the CUDA-gated cases of the adopted
-  upstream files; no test is skipped unconditionally.  Two new CPU tests pin
-  the load-time sampling guards and the distillation rejection.
-- FSDP suite (`tests/test_fsdp_*.py`): 20 passed / 9 failed / 11 skipped, and
-  the same cases fail on the unmodified base commit, i.e. they are pre-existing
-  NPU gaps rather than regressions from this commit.
-- Runtime smoke (Qwen2.5-1.5B, GSM8K, 2 dies, sampler weight noise 0.02/seed 42):
-  every step reports `sc_active=1`, `loss_mode=1`, `rs_upper=2.0` and a non-zero,
-  stable `sc_correction`.
-- Not run: multi-node, Megatron, MoE, virtual pipeline, multimodal, the
-  paper-style Countdown reproduction, `pre-commit run --all-files` (ruff
-  check/format were run directly: clean), and the docs site build.
-
-Known limitations: an absent top-k slot still gathers a trainer log-probability,
-so padded positions rely on `loss_mask` alignment; `rho` is unbounded when a row
-carries no head mass (also true upstream); the head width is capped at k, so the
-(k+1)-th alternative can be dropped; `validate_sampling`'s SGLang-oriented branch
-is unused here.
----
- areal/api/cli_args.py                         | 191 +++++++-
- areal/api/io_struct.py                        |  11 +
- areal/engine/fsdp_engine.py                   |  53 +++
- areal/engine/vllm_remote.py                   |  83 +++-
- areal/experimental/openai/client.py           |  22 +-
- .../openai/proxy/proxy_rollout_server.py      |   1 +
- areal/experimental/openai/types.py            |  64 +++
- areal/infra/remote_inf_engine.py              |  60 +++
- areal/trainer/ppo/actor.py                    | 155 ++++++-
- areal/utils/data.py                           |  68 ++-
- areal/utils/score_centering.py                | 308 +++++++++++++
- areal/utils/topk_padding.py                   |  23 +
- areal/workflow/rlvr.py                        |  66 ++-
- docs/en/cli_reference.md                      |  40 +-
- docs/zh/cli_reference.md                      |  40 +-
- examples/math/README.md                       |  54 +++
- tests/test_rollout_version_race.py            |   8 +-
- tests/test_score_centering.py                 | 432 ++++++++++++++++++
- tests/test_score_centering_guards.py          |  87 ++++
- tests/test_score_centering_objective.py       |  88 ++++
- tests/test_score_centering_pipeline.py        | 282 ++++++++++++
- tests/test_score_centering_tis.py             | 226 +++++++++
- 22 files changed, 2308 insertions(+), 54 deletions(-)
- create mode 100644 areal/utils/score_centering.py
- create mode 100644 areal/utils/topk_padding.py
- create mode 100644 tests/test_score_centering.py
- create mode 100644 tests/test_score_centering_guards.py
- create mode 100644 tests/test_score_centering_objective.py
- create mode 100644 tests/test_score_centering_pipeline.py
- create mode 100644 tests/test_score_centering_tis.py
-
 diff --git a/areal/api/cli_args.py b/areal/api/cli_args.py
 index 3c875dc..ce51e2d 100644
 --- a/areal/api/cli_args.py
 +++ b/areal/api/cli_args.py
-@@ -196,6 +196,15 @@ class GenerationHyperparameters:
-         default=1.0,
-         metadata={"help": "Sampling temperature. Higher values increase diversity."},
+@@ -198,2 +198,11 @@ class GenerationHyperparameters:
      )
 +    # Score Centering: number of top-k logprobs to request from sampler
 +    score_centering_top_k: int = field(
@@ -108,19 +14,11 @@ index 3c875dc..ce51e2d 100644
 +        },
 +    )
      stop_token_ids: list[int] = field(
-         default_factory=list,
-         metadata={"help": "Stop generation when encountering these token IDs."},
-@@ -271,6 +280,7 @@ class GenerationHyperparameters:
-         )
- 
+@@ -273,2 +282,3 @@ class GenerationHyperparameters:
      _OPENAI_UNSUPPORTED_ARGS: ClassVar[set[str]] = {
 +        "score_centering_top_k",  # Carried by the SC-aware proxy, not the SDK
          "min_new_tokens",  # Not supported by OpenAI
-         "greedy",  # Not directly supported by OpenAI
-         "top_k",  # Not supported by OpenAI
-@@ -1667,10 +1677,19 @@ class RejectionSamplingConfig:
-                     f"upper must be > 1.0 for 'ratio' metric (otherwise all non-identical "
-                     f"policy tokens will be filtered), got {self.upper}"
+@@ -1669,3 +1679,6 @@ class RejectionSamplingConfig:
                  )
 -            if self.lower is not None and self.lower <= 0:
 +            # A clamp with lower=0 is meaningful (weights are floored at zero) and
@@ -128,7 +26,7 @@ index 3c875dc..ce51e2d 100644
 +            # lower: 0.0, so only masking still requires a positive bound.
 +            if self.lower is not None and self.action != "clamp" and self.lower <= 0:
                  raise ValueError(
-                     f"lower must be positive for 'ratio' metric, got {self.lower}"
+@@ -1673,2 +1686,8 @@ class RejectionSamplingConfig:
                  )
 +            # A clamp floors the weight, so zero is meaningful there; a negative floor
 +            # is not.
@@ -137,11 +35,7 @@ index 3c875dc..ce51e2d 100644
 +                    f"lower must be non-negative for 'clamp', got {self.lower}"
 +                )
          # For KL metrics, upper must be > 0.
-         # Note: kl_k1 is excluded because it is a forward KL unbiased estimator that
-         # can produce negative values, so requiring upper > 0 would be too restrictive.
-@@ -1875,6 +1894,44 @@ class PPOActorConfig(TrainEngineConfig):
-             "Unused by other loss aggregation modes.",
-         },
+@@ -1877,2 +1896,40 @@ class PPOActorConfig(TrainEngineConfig):
      )
 +    # Score Centering (arXiv:2609.20807) — additive drift correction
 +    use_score_centering: bool = field(
@@ -182,11 +76,7 @@ index 3c875dc..ce51e2d 100644
 +    )
 +
      # Logging Agent Trajectories
-     log_agent_stats: bool = field(
-         default=False,
-@@ -1953,8 +2010,16 @@ class PPOActorConfig(TrainEngineConfig):
-                 "training supports only 'token-mean'."
-             )
+@@ -1955,4 +2012,12 @@ class PPOActorConfig(TrainEngineConfig):
          # Warn if rejection_sampling is configured but use_decoupled_loss is False
 -        if not self.use_decoupled_loss and (
 -            self.rejection_sampling is not None or self.importance_sampling is not None
@@ -201,11 +91,7 @@ index 3c875dc..ce51e2d 100644
 +                or self.importance_sampling is not None
 +            )
          ):
-             logger.warning(
-                 "rollout correction is configured but use_decoupled_loss=False. "
-@@ -2006,7 +2071,59 @@ class PPOActorConfig(TrainEngineConfig):
-                     "SAPO is not compatible with `use_decoupled_loss=True`. "
-                     "Please set `actor.use_decoupled_loss=false` in your configuration."
+@@ -2008,3 +2073,55 @@ class PPOActorConfig(TrainEngineConfig):
                  )
 +            if self.sc_reinforce_baseline:
 +                raise ValueError(
@@ -261,21 +147,13 @@ index 3c875dc..ce51e2d 100644
 +                    "or use_score_centering=False."
 +                )
          super().__post_init__()
- 
- 
-@@ -2066,6 +2183,9 @@ class vLLMConfig:
-     # original
-     max_num_batched_tokens: int = 2048
+@@ -2068,2 +2185,5 @@ class vLLMConfig:
      max_num_seqs: int = 256
 +    # Score Centering: vLLM caps logprobs at max_logprobs (default 20).
 +    # Auto-raised from gconfig.score_centering_top_k in PPOConfig.__post_init__.
 +    max_logprobs: int = 20
      # kv_cache_type: str = "auto"
-     block_size: int = 16
-     cpu_offload_gb: float = 0
-@@ -2707,6 +2827,14 @@ class InferenceEngineConfig:
-             "PPOConfig.__post_init__ so load and request sides stay in sync."
-         },
+@@ -2709,2 +2829,10 @@ class InferenceEngineConfig:
      )
 +    score_centering_top_k: int = field(
 +        default=0,
@@ -286,11 +164,7 @@ index 3c875dc..ce51e2d 100644
 +        },
 +    )
      agent: AgentConfig = field(
-         default_factory=lambda: AgentConfig(
-             agent_cls_path="areal.experimental.openai.proxy.online_agent._OnlineAgent"
-@@ -3705,6 +3833,63 @@ class PPOConfig(BaseExperimentConfig):
-         # the engine config. Single source of truth: gconfig.lora_name.
-         if self.rollout.use_lora and not self.rollout.lora_name:
+@@ -3707,2 +3835,59 @@ class PPOConfig(BaseExperimentConfig):
              self.rollout.lora_name = self.gconfig.lora_name
 +        # Score Centering: generation.score_centering_top_k is the single source
 +        # of truth. The OpenAI request side cannot read gconfig, so mirror it to
@@ -350,15 +224,11 @@ index 3c875dc..ce51e2d 100644
 +                    "score centering."
 +                )
          super().__post_init__()
- 
- 
 diff --git a/areal/api/io_struct.py b/areal/api/io_struct.py
 index 3f9c4b2..ca4d582 100644
 --- a/areal/api/io_struct.py
 +++ b/areal/api/io_struct.py
-@@ -101,6 +101,12 @@ class ModelResponse:
-     # MoE routing (only populated when return_routed_experts=True)
-     routed_experts: np.ndarray | None = None
+@@ -103,2 +103,8 @@ class ModelResponse:
  
 +    # Score Centering: per-token top-k from sampler
 +    # Width equals the requested k: vLLM puts the sampled token first and then
@@ -367,11 +237,7 @@ index 3f9c4b2..ca4d582 100644
 +    sampler_head_logprobs: list[list[float]] | None = None  # [n_output_tokens, k]
 +
      @property
-     def input_len(self) -> int:
-         return len(self.input_tokens)
-@@ -411,6 +417,11 @@ class HttpGenerationResult:
-     output_logprobs: list[float]
-     stop_reason: str
+@@ -413,2 +419,7 @@ class HttpGenerationResult:
      routed_experts: np.ndarray | None = None
 +    # Score Centering: per-token top-k token IDs and log-probs from sampler
 +    # Width equals the requested k: vLLM puts the sampled token first and then
@@ -379,15 +245,11 @@ index 3f9c4b2..ca4d582 100644
 +    sampler_head_ids: list[list[int]] | None = None  # [n_output_tokens, k]
 +    sampler_head_logprobs: list[list[float]] | None = None  # [n_output_tokens, k]
  
- 
- @dataclass
 diff --git a/areal/engine/fsdp_engine.py b/areal/engine/fsdp_engine.py
 index c487f34..71ae8c6 100644
 --- a/areal/engine/fsdp_engine.py
 +++ b/areal/engine/fsdp_engine.py
-@@ -400,6 +400,18 @@ class FSDPEngine(TrainEngine):
-             raise ValueError(
-                 "Tree training currently cannot be enabled with sp_size > 1."
+@@ -402,2 +402,14 @@ class FSDPEngine(TrainEngine):
              )
 +        # Score centering on this branch rides the vLLM transport, which cannot
 +        # hand the trainer sharded heads.  Reject the layouts here so the failure
@@ -402,21 +264,13 @@ index c487f34..71ae8c6 100644
 +                "sequences on the vLLM transport."
 +            )
          # Monkey patch: replace attention's forward() with Ulysses variant.
-         apply_monkey_patch(
-             model=self.model,
-@@ -2030,6 +2042,9 @@ class FSDPEngine(TrainEngine):
- 
-         inputs.pop("unit_weights", None)
+@@ -2032,2 +2044,5 @@ class FSDPEngine(TrainEngine):
          inputs.pop("is_truncated", None)
 +        # Sampler heads feed the score-centering loss, not the model forward.
 +        for head_key in ("sampler_head_ids", "sampler_head_logprobs"):
 +            inputs.pop(head_key, None)
          ctx = FSDPTrainContext(
-             model_inputs=inputs,
-             mb_input=mb_item.orig_mb,
-@@ -2185,12 +2200,50 @@ class FSDPEngine(TrainEngine):
-                     entropy = entropy[: -ctx.pad_length]
-                     vocab_min_logits = vocab_min_logits[: -ctx.pad_length]
+@@ -2187,2 +2202,39 @@ class FSDPEngine(TrainEngine):
                      vocab_max_logits = vocab_max_logits[: -ctx.pad_length]
 +            # Cross-file contract: the actor's grpo_loss_fn accepts a keyword-only
 +            # `sc_correction`. Passing it here keeps the engine free of any import
@@ -456,22 +310,15 @@ index c487f34..71ae8c6 100644
 +                    )
 +                )
              loss = loss_fn(
-                 logprobs,
-                 entropy,
-                 ctx.mb_input,
-                 vocab_min_logits=vocab_min_logits,
+@@ -2193,2 +2245,3 @@ class FSDPEngine(TrainEngine):
                  vocab_max_logits=vocab_max_logits,
 +                **sc_kwargs,
              )
-         else:
-             values = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)
 diff --git a/areal/engine/vllm_remote.py b/areal/engine/vllm_remote.py
 index 511b70c..1e06b14 100644
 --- a/areal/engine/vllm_remote.py
 +++ b/areal/engine/vllm_remote.py
-@@ -78,6 +78,53 @@ def _check_placeholder_count(req: ModelRequest) -> None:
-         )
- 
+@@ -80,2 +80,49 @@ def _check_placeholder_count(req: ModelRequest) -> None:
  
 +def _token_to_id(token: object) -> int | None:
 +    """Best-effort conversion of a top-logprob token key to an int id."""
@@ -521,11 +368,7 @@ index 511b70c..1e06b14 100644
 +
 +
  class VLLMBackend:
-     """vLLM-specific backend implementation for remote inference."""
- 
-@@ -123,8 +170,9 @@ class VLLMBackend:
-             "ignore_eos": gconfig.ignore_eos,
-             "skip_special_tokens": gconfig.skip_special_tokens,
+@@ -125,4 +172,5 @@ class VLLMBackend:
              "frequency_penalty": gconfig.frequency_penalty,
 -            # 0 = the sampled token's own logprob, no top-k alternatives.
 -            "logprobs": 0,
@@ -533,11 +376,7 @@ index 511b70c..1e06b14 100644
 +            # per position; 0 requests only the sampled token logprob.
 +            "logprobs": getattr(gconfig, "score_centering_top_k", 0),
          }
-         if gconfig.stop:
-             # Stop strings require server-side detokenization, so `detokenize`
-@@ -198,10 +246,41 @@ class VLLMBackend:
-                 f"{len(output_logprobs)} logprobs; they must stay parallel."
-             )
+@@ -200,2 +248,31 @@ class VLLMBackend:
  
 +        # Score Centering: parse per-position top-k alternatives.  vLLM <= 0.23
 +        # exposes them at logprobs["top_logprobs"]; >= 0.30 nests them per position
@@ -569,21 +408,16 @@ index 511b70c..1e06b14 100644
 +                sampler_head_logprobs = None
 +
          return HttpGenerationResult(
-             output_tokens=output_tokens,
-             output_logprobs=output_logprobs,
+@@ -204,2 +281,4 @@ class VLLMBackend:
              stop_reason=stop_reason,
 +            sampler_head_ids=sampler_head_ids,
 +            sampler_head_logprobs=sampler_head_logprobs,
          )
- 
-     def build_score_request(
 diff --git a/areal/experimental/openai/client.py b/areal/experimental/openai/client.py
 index 62f86fb..efa0ca2 100644
 --- a/areal/experimental/openai/client.py
 +++ b/areal/experimental/openai/client.py
-@@ -255,7 +255,15 @@ def drop_vision_pad_tokens(response: Any, pad_ids: frozenset[int]) -> None:
-     if not n_dropped:
-         return
+@@ -257,3 +257,11 @@ def drop_vision_pad_tokens(response: Any, pad_ids: frozenset[int]) -> None:
      response.output_tokens = [response.output_tokens[i] for i in keep]
 -    for attr in ("output_logprobs", "output_versions"):
 +    for attr in (
@@ -596,141 +430,77 @@ index 62f86fb..efa0ca2 100644
 +        "sampler_head_logprobs",
 +    ):
          seq = getattr(response, attr, None)
-         if seq is not None and len(seq) == n_dropped + len(keep):
-             setattr(response, attr, [seq[i] for i in keep])
-@@ -865,6 +873,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
-         chat_template_kwargs: Mapping[str, Any] | None = None,
-         lora_name: str = "",
+@@ -867,2 +875,3 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
          processor: Any | None = None,
 +        score_centering_top_k: int = 0,
      ):
-         super().__init__(client)
-         self.engine = engine
-@@ -878,6 +887,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
-         self.lora_name = lora_name
-         self.processor = processor
+@@ -880,2 +889,3 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
          self.vision_pad_ids = vision_pad_token_ids(tokenizer, processor=processor)
 +        self.score_centering_top_k = score_centering_top_k
  
-     def _retains_collapsed_prompts(self) -> bool:
-         """Whether a future concat child could read the collapsed prompt."""
-@@ -1041,6 +1051,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
-             interaction = InteractionWithTokenLogpReward(
-                 messages=deepcopy(messages_list),  # Store a copy of the input messages
+@@ -1043,2 +1053,3 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
                  chat_template_type=self.chat_template_type,
 +                score_centering_top_k=self.score_centering_top_k,
              )
-             cache[completion_id] = interaction
- 
-@@ -1228,6 +1239,7 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
-             greedy=temp == 0,
-             frequency_penalty=frequency_penalty,
+@@ -1230,2 +1241,3 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
              lora_name=self.lora_name,
 +            score_centering_top_k=self.score_centering_top_k,
              stop_token_ids=list(
-                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
-             ),
-@@ -1438,6 +1450,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
-         chat_template_kwargs: Mapping[str, Any] | None = None,
-         lora_name: str = "",
+@@ -1440,2 +1452,3 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
          processor: Any | None = None,
 +        score_centering_top_k: int = 0,
      ):
-         super().__init__(client)
-         self.engine = engine
-@@ -1451,6 +1464,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
-         self.lora_name = lora_name
-         self.processor = processor
+@@ -1453,2 +1466,3 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
          self.vision_pad_ids = vision_pad_token_ids(tokenizer, processor=processor)
 +        self.score_centering_top_k = score_centering_top_k
  
-     def _retains_collapsed_prompts(self) -> bool:
-         """Whether a future concat child could read the collapsed prompt."""
-@@ -1521,6 +1535,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
-         interaction = InteractionWithTokenLogpReward(
-             messages=deepcopy(messages_list),  # Store a copy of the input messages
+@@ -1523,2 +1537,3 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
              chat_template_type=self.chat_template_type,
 +            score_centering_top_k=self.score_centering_top_k,
              input_data=(
-                 deepcopy(input) if not is_omitted(input) else ""
-             ),  # Store a copy of the input data
-@@ -1663,6 +1678,7 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
-             greedy=temp == 0,
-             frequency_penalty=frequency_penalty,
+@@ -1665,2 +1680,3 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
              lora_name=self.lora_name,
 +            score_centering_top_k=self.score_centering_top_k,
              stop_token_ids=list(
-                 set([self.tokenizer.eos_token_id, self.tokenizer.pad_token_id])
-             ),
-@@ -1815,6 +1831,7 @@ class ArealOpenAI(AsyncOpenAI):
-         chat_template_kwargs: Mapping[str, Any] | None = None,
-         lora_name: str = "",
+@@ -1817,2 +1833,3 @@ class ArealOpenAI(AsyncOpenAI):
          processor: Any | None = None,
 +        score_centering_top_k: int = 0,
          **kwargs,
-     ):
-         super().__init__(**kwargs)
-@@ -1824,6 +1841,7 @@ class ArealOpenAI(AsyncOpenAI):
-         self.reasoning_parser = reasoning_parser
-         self.lora_name = lora_name
+@@ -1826,2 +1843,3 @@ class ArealOpenAI(AsyncOpenAI):
          self.processor = processor
 +        self.score_centering_top_k = score_centering_top_k
  
-         # Use an ordered dict to maintain insertion order of completions/responses
-         self._cache: InteractionCache = InteractionCache()
-@@ -1841,6 +1859,7 @@ class ArealOpenAI(AsyncOpenAI):
-             chat_template_kwargs=chat_template_kwargs,
-             lora_name=lora_name,
+@@ -1843,2 +1861,3 @@ class ArealOpenAI(AsyncOpenAI):
              processor=processor,
 +            score_centering_top_k=self.score_centering_top_k,
          )
- 
-         # Override chat.completions with our extended implementation
-@@ -1856,6 +1875,7 @@ class ArealOpenAI(AsyncOpenAI):
-             chat_template_kwargs=chat_template_kwargs,
-             lora_name=lora_name,
+@@ -1858,2 +1877,3 @@ class ArealOpenAI(AsyncOpenAI):
              processor=processor,
 +            score_centering_top_k=self.score_centering_top_k,
          )
- 
-     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:
 diff --git a/areal/experimental/openai/proxy/proxy_rollout_server.py b/areal/experimental/openai/proxy/proxy_rollout_server.py
 index 0516a26..35d0918 100644
 --- a/areal/experimental/openai/proxy/proxy_rollout_server.py
 +++ b/areal/experimental/openai/proxy/proxy_rollout_server.py
-@@ -306,6 +306,7 @@ def _setup_openai_client():
-         tool_call_parser=agent_cfg.tool_call_parser,
-         reasoning_parser=agent_cfg.reasoning_parser,
+@@ -308,2 +308,3 @@ def _setup_openai_client():
          engine_max_tokens=agent_cfg.engine_max_tokens,
 +        score_centering_top_k=getattr(config, "score_centering_top_k", 0),
          chat_template_type=agent_cfg.chat_template_type,
-         chat_template_kwargs=chat_template_kwargs,
-         lora_name=config.lora_name,
 diff --git a/areal/experimental/openai/types.py b/areal/experimental/openai/types.py
 index 3c31ca5..a44ec46 100644
 --- a/areal/experimental/openai/types.py
 +++ b/areal/experimental/openai/types.py
-@@ -14,6 +14,7 @@ from openai.types.responses.response_input_param import ResponseInputParam
- 
- from areal.api import ModelResponse
+@@ -16,2 +16,3 @@ from areal.api import ModelResponse
  from areal.utils import logging
 +from areal.utils.topk_padding import pad_topk_ids, pad_topk_logps
  
- logger = logging.getLogger("TokenLogpReward")
- 
-@@ -69,6 +70,9 @@ class InteractionWithTokenLogpReward:
-     trajectory_metadata: dict[str, str] = field(default_factory=dict)
-     _cache: dict[str, torch.Tensor] | None = None
+@@ -71,2 +72,5 @@ class InteractionWithTokenLogpReward:
  
 +    # score_centering_top_k from the engine config; caps k_dim in to_tensor_dict().  0 = SC off.
 +    score_centering_top_k: int = 0
 +
      # Vision payload for VLM training. ``mm_token_type_ids`` covers the prompt
-     # only (it is extended with zeros over the output at tensor-dict time);
-     # ``multi_modal_input`` holds a single dict for the whole sequence, matching
-@@ -261,6 +265,66 @@ class InteractionWithTokenLogpReward:
-                 _align_mm_token_type_ids(self.mm_token_type_ids, resp, len(seq)),
-                 dtype=torch.long,
+@@ -263,2 +267,62 @@ class InteractionWithTokenLogpReward:
              ).unsqueeze(0)
 +        # Score Centering: propagate sampler top-k logprobs if available.
 +        # Mirrors rlvr.py SC logic: input positions get zero top-k (no sampler
@@ -793,15 +563,11 @@ index 3c31ca5..a44ec46 100644
 +                    input_topk_logps + sampler_head_logprobs, dtype=torch.float32
 +                ).unsqueeze(0)  # [1, seq_len, k]
          self._cache = result
-         return result
- 
 diff --git a/areal/infra/remote_inf_engine.py b/areal/infra/remote_inf_engine.py
 index 779da22..3ca5bef 100644
 --- a/areal/infra/remote_inf_engine.py
 +++ b/areal/infra/remote_inf_engine.py
-@@ -461,6 +461,21 @@ class RemoteInfBackendProtocol(Protocol):
-         ...
- 
+@@ -463,2 +463,17 @@ class RemoteInfBackendProtocol(Protocol):
  
 +def require_topk_heads(accumulated_head_ids, top_k: int) -> None:
 +    """Fail loudly when score centering was requested but no chunk carried heads.
@@ -819,20 +585,12 @@ index 779da22..3ca5bef 100644
 +
 +
  class RemoteInfEngine(InferenceEngine):
-     """
-     Base implementation for HTTP-based remote inference engines.
-@@ -1086,6 +1101,8 @@ class RemoteInfEngine(InferenceEngine):
-         accumulated_output_logprobs = []
-         accumulated_versions = []
+@@ -1088,2 +1103,4 @@ class RemoteInfEngine(InferenceEngine):
          accumulated_routed_experts: list[np.ndarray] = []
 +        accumulated_topk_ids = []
 +        accumulated_topk_logps = []
  
-         # A single "rid" shares the same server to allow KV cache reuse
-         if req.rid in self.rid_to_address:
-@@ -1168,6 +1185,25 @@ class RemoteInfEngine(InferenceEngine):
-             # Accumulate routed_experts for MoE models
-             if gen_result.routed_experts is not None:
+@@ -1170,2 +1187,21 @@ class RemoteInfEngine(InferenceEngine):
                  accumulated_routed_experts.append(gen_result.routed_experts)
 +            # Accumulate SC top-k fields
 +            if gen_result.sampler_head_ids is not None:
@@ -854,11 +612,7 @@ index 779da22..3ca5bef 100644
 +                    )
 +                accumulated_topk_logps.extend(gen_result.sampler_head_logprobs)
  
-             # Update request for next iteration
-             req.extend_prompt(gen_result.output_tokens)
-@@ -1178,6 +1214,26 @@ class RemoteInfEngine(InferenceEngine):
-                 len(req.input_ids),
-             )
+@@ -1180,2 +1216,22 @@ class RemoteInfEngine(InferenceEngine):
  
 +        # Every chunk must contribute heads or none at all; a single chunk that
 +        # dropped them would shift the rows relative to the tokens they describe.
@@ -881,37 +635,25 @@ index 779da22..3ca5bef 100644
 +        require_topk_heads(accumulated_topk_ids, gconfig.score_centering_top_k)
 +
          # Final abort handling
-         if stop_reason == "abort":
-             # If stop_reason is "abort", the only reason we exit the loop is
-@@ -1207,6 +1263,10 @@ class RemoteInfEngine(InferenceEngine):
-             tokenizer=req.tokenizer,
-             processor=req.processor,
+@@ -1209,2 +1265,6 @@ class RemoteInfEngine(InferenceEngine):
              routed_experts=accumulated_routed_experts,
 +            sampler_head_ids=accumulated_topk_ids if accumulated_topk_ids else None,
 +            sampler_head_logprobs=accumulated_topk_logps
 +            if accumulated_topk_logps
 +            else None,
          )
-         return response
- 
 diff --git a/areal/trainer/ppo/actor.py b/areal/trainer/ppo/actor.py
 index d649cab..7271b90 100644
 --- a/areal/trainer/ppo/actor.py
 +++ b/areal/trainer/ppo/actor.py
-@@ -44,6 +44,10 @@ from areal.utils.functional import (
- )
- from areal.utils.functional.loss_aggregation import PolicyGradientReduction
+@@ -46,2 +46,6 @@ from areal.utils.functional.loss_aggregation import PolicyGradientReduction
  from areal.utils.perf_tracer import trace_perf
 +from areal.utils.score_centering import (
 +    resolve_score_centering_tis_cap,
 +    score_centering_tis_weights,
 +)
  from areal.utils.stats_tracker import ReduceType
- 
- logger = logging.getLogger("PPOActor")
-@@ -256,6 +260,11 @@ class PPOActor:
-             data["behavior_logp"] = behavior_logp
-             old_logp = data["logprobs"] = prox_logp_value
+@@ -258,2 +262,7 @@ class PPOActor:
          else:
 +            # When recompute_logprob=False, old_logp is the inference-engine
 +            # (sampler) log-probability, already shifted by -1 above so that it is
@@ -919,11 +661,7 @@ index d649cab..7271b90 100644
 +            # are masked by loss_mask downstream; the shifted value is written
 +            # back to data["logprobs"] together with the other rolled quantities.
              old_logp = behavior_logp
-             if not self.config.use_decoupled_loss:
-                 # prox logp not available, use inferenced logp
-@@ -334,6 +343,18 @@ class PPOActor:
-         # because we have rolled old_logp by -1
-         data["logprobs"] = old_logp
+@@ -336,2 +345,14 @@ class PPOActor:
  
 +        # Roll sampler top-k data by -1 on the sequence dim to match
 +        # source-aligned (shifted) loss_mask / logprobs.  The sampler produces
@@ -938,32 +676,20 @@ index d649cab..7271b90 100644
 +                data[key] = torch.roll(data[key], shifts=-1, dims=1)
 +
          return data
- 
-     @trace_perf("ppo_actor.ppo_update", category="compute")
-@@ -493,6 +514,9 @@ class PPOActor:
-                         sapo_tau_neg=self.config.sapo_tau_neg,
-                         use_decoupled_loss=self.config.use_decoupled_loss,
+@@ -495,2 +516,5 @@ class PPOActor:
                          pg_reduction=loss_step,
 +                        use_score_centering=self.config.use_score_centering,
 +                        sc_reinforce_baseline=self.config.sc_reinforce_baseline,
 +                        sc_loss_mode=self.config.sc_loss_mode,
                      ),
-                     loss_weight_fn=loss_step.normalizer_fn,
-                 )
-@@ -649,6 +673,10 @@ def grpo_loss_fn(
-     vocab_max_logits: torch.Tensor | None = None,
-     vocab_mean_logits: torch.Tensor | None = None,
+@@ -651,2 +675,6 @@ def grpo_loss_fn(
      vocab_norm_logits: torch.Tensor | None = None,
 +    use_score_centering: bool = False,
 +    sc_correction: torch.Tensor | None = None,
 +    sc_reinforce_baseline: bool = False,
 +    sc_loss_mode: str = "reinforce",
  ):
-     """Loss function for actor step, all inputs should be splitted into
-     pipeline micro batches, returns loss and logging stats."""
-@@ -736,8 +764,106 @@ def grpo_loss_fn(
-             unit_weights=input_data.get("unit_weights"),
-         )
+@@ -738,4 +766,102 @@ def grpo_loss_fn(
  
 +    # Score Centering (SC): Plan A replaces the clipped PPO surrogate with
 +    # REINFORCE + SC (default); Plan B keeps the surrogate and adds the
@@ -998,3 +724,627 @@ index d649cab..7271b90 100644
 +                    -advantages.detach() * sc_weight * logprobs
 +                )  # -A · w · log p(a); w = 1 without TIS
 +                combined = torch.where(
++                    loss_mask,
++                    pg_term + sc_term,
++                    torch.zeros_like(pg_term),
++                )
++                loss = pg_reduction.aggregate(
++                    combined,
++                    loss_mask,
++                    denominator_mask=denominator_mask,
++                    cu_seqlens=input_data.get("cu_seqlens"),
++                    unit_weights=input_data.get("unit_weights"),
++                )
++                sc_loss_overridden = True
++                loss_mode = "reinforce_sc"
++            else:
++                # Plan B: PPO clipped surrogate + SC (additive)
++                # loss is already the PPO clipped surrogate from
++                # ppo_actor_loss_fn above; add the SC correction term.
++                sc_combined = torch.where(
++                    loss_mask,
++                    sc_term,
++                    torch.zeros_like(sc_term),
++                )
++                sc_additive = pg_reduction.aggregate(
++                    sc_combined,
++                    loss_mask,
++                    denominator_mask=denominator_mask,
++                    cu_seqlens=input_data.get("cu_seqlens"),
++                    unit_weights=input_data.get("unit_weights"),
++                )
++                loss = loss + sc_additive
++                sc_loss_overridden = False  # PPO stats are still meaningful
++                loss_mode = "ppo_sc"
++            sc_loss = sc_term.detach()  # for logging
++        else:
++            raise ValueError(
++                "use_score_centering=True but the engine supplied no sc_correction; "
++                f"input_data keys={list(input_data.keys())[:18]}. "
++                "This usually means the sampler returned no top-k log-probs. "
++                "Check that score_centering_top_k is set and that vLLM is allowed "
++                "to return that many log-probs, or disable use_score_centering."
++            )
++    elif sc_reinforce_baseline:
++        # A1 baseline: pure REINFORCE (-A·log p(a)), no PPO ratio, no clipping.
++        # Used for fair SC-on vs SC-off comparison under Plan A.
++        pg_term = -advantages.detach() * logprobs  # -A·log p(a), grad through logprobs
++        combined = torch.where(
++            loss_mask,
++            pg_term,
++            torch.zeros_like(pg_term),
++        )
++        loss = pg_reduction.aggregate(
++            combined,
++            loss_mask,
++            denominator_mask=denominator_mask,
++            cu_seqlens=input_data.get("cu_seqlens"),
++            unit_weights=input_data.get("unit_weights"),
++        )
++        sc_loss_overridden = True
++        loss_mode = "reinforce_baseline"
++
+     # Joint Distillation KL Loss
+     teacher_logp = input_data.get("teacher_logp")
++    if (use_score_centering or sc_reinforce_baseline) and teacher_logp is not None:
++        raise ValueError(
++            "Score centering with distillation is not supported: the "
++            "distillation branch would replace the REINFORCE+SC objective."
++        )
+     rkl_stat = None
+@@ -849,3 +975,3 @@ def grpo_loss_fn(
+         entropy=entropy.float(),
+-        actor_loss=stat["loss"],
++        actor_loss=stat["loss"] if not sc_loss_overridden else combined.detach(),
+         clip_ratio=stat["clip_mask"].float(),
+@@ -854,2 +980,16 @@ def grpo_loss_fn(
+     )
++    # The scalar tracker accepts numbers only. Dashboard loss-mode codes:
++    # 0 = PPO, 1 = REINFORCE + SC, 2 = REINFORCE baseline, 3 = PPO + SC.
++    loss_mode_codes = {
++        "ppo": 0,
++        "reinforce_sc": 1,
++        "reinforce_baseline": 2,
++        "ppo_sc": 3,
++    }
++    if use_score_centering or sc_reinforce_baseline:
++        # Only scored runs need these; plain PPO users would otherwise see two
++        # permanently zero series.
++        stats_tracker.scalar(loss_mode=loss_mode_codes[loss_mode])
++        # 1 when the correction was applied this step, 0 when SC was skipped.
++        stats_tracker.scalar(sc_active=1 if sc_correction is not None else 0)
+     if "behave_imp_weight" in stat:
+@@ -904,2 +1044,15 @@ def grpo_loss_fn(
+ 
++    # Score centering reports the correction itself; the head/tail diagnostics
++    # (s_bar, q_mass, p_mass, rho) are internal to the engine-side computation.
++    if sc_correction is not None:
++        stats_tracker.stat(
++            sc_correction=sc_correction.detach(),
++            denominator="n_valid_tokens",
++        )
++        if sc_loss is not None:
++            stats_tracker.stat(
++                sc_loss_term=sc_loss,
++                denominator="n_valid_tokens",
++            )
++
+     return loss
+diff --git a/areal/utils/data.py b/areal/utils/data.py
+index c705ab7..843c034 100644
+--- a/areal/utils/data.py
++++ b/areal/utils/data.py
+@@ -207,2 +207,5 @@ def _pad_cat_dim0(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.
+ 
++    Padding is zero except for `sampler_head_logprobs`, which is filled with
++    ``-inf`` so the padded slots carry no sampler probability mass.
++
+     For 0D/1D tensors no padding is needed — they are simply concatenated.
+@@ -349,3 +352,11 @@ def concat_padded_tensors(
+         if isinstance(values[0], torch.Tensor):
+-            pv = 0.0 if key == "attention_mask" else pad_value
++            if key == "attention_mask":
++                pv = 0.0
++            elif key == "sampler_head_logprobs":
++                # Only the SC sampler log-probs need -inf padding: exp(-inf) is 0,
++                # so padded slots carry no probability mass.  Every other logprob key
++                # keeps 0.0 padding and is masked by loss_mask downstream.
++                pv = float("-inf")
++            else:
++                pv = pad_value
+             result[key] = _pad_cat_dim0(values, pad_value=pv)
+@@ -360,5 +371,5 @@ def concat_padded_tensors(
+ def _unpad_splits(
+-    splits: list[torch.Tensor], traj_seqlens: list[int] | None
++    splits: list[torch.Tensor], traj_seqlens: list[int] | None, *, seq_dim: int = -1
+ ) -> list[torch.Tensor]:
+-    """Trim each split tensor's last dim to its original sequence length."""
++    """Trim each split tensor's sequence dimension to its original length."""
+     if traj_seqlens is None:
+@@ -366,4 +377,4 @@ def _unpad_splits(
+     for i, s in enumerate(splits):
+-        if s.ndim >= 2 and s.shape[-1] > traj_seqlens[i]:
+-            splits[i] = s[..., : traj_seqlens[i]]
++        if s.ndim >= 2 and s.shape[seq_dim] > traj_seqlens[i]:
++            splits[i] = s.narrow(seq_dim, 0, traj_seqlens[i])
+     return splits
+@@ -371,2 +382,11 @@ def _unpad_splits(
+ 
++# Payloads laid out as [tokens, k]: the sequence dimension is dim 1, so padding
++# must be trimmed there instead of on the (narrow) head axis.
++_TOKEN_PAYLOAD_KEYS = (
++    "routed_experts",
++    "sampler_head_ids",
++    "sampler_head_logprobs",
++)
++
++
+ def split_and_unpad_tensor(
+@@ -406,5 +426,10 @@ def split_and_unpad_tensor(
+             if isinstance(value, torch.Tensor) and value.shape[0] == total:
+-                splits = _unpad_splits(
+-                    list(value.split(traj_group_sizes, dim=0)), traj_seqlens
+-                )
++                splits = list(value.split(traj_group_sizes, dim=0))
++                if key in _TOKEN_PAYLOAD_KEYS:
++                    # Only trim when there is a real token axis to trim; a 2D
++                    # [tokens, k] payload must keep its head width intact.
++                    if value.ndim >= 3:
++                        splits = _unpad_splits(splits, traj_seqlens, seq_dim=1)
++                else:
++                    splits = _unpad_splits(splits, traj_seqlens)
+                 for i, s in enumerate(splits):
+@@ -858,4 +883,13 @@ def split_padded_tensor_dict_into_mb_list(
+             continue
+-        if key == "position_ids" or (
+-            torch.is_tensor(value) and value.numel() == bs * max_seqlen
++        if (
++            key == "position_ids"
++            or (torch.is_tensor(value) and value.numel() == bs * max_seqlen)
++            or (
++                # Also split 3D [bs, max_seqlen, k] sampler tensors so packing yields
++                # [total_tokens, k]; ndim >= 3 avoids matching 2D [bs, seq] tensors.
++                torch.is_tensor(value)
++                and value.ndim >= 3
++                and value.shape[0] == bs
++                and value.shape[1] == max_seqlen
++            )
+         ):
+@@ -981,2 +1015,12 @@ def pad_packed_tensor_dict(
+                 sequence_padded_data["max_seqlen"] = max_seqlens_padded
++            elif key in ("sampler_head_ids", "sampler_head_logprobs"):
++                fill = float("-inf") if key == "sampler_head_logprobs" else 0
++                new_value = value.new_full((padded_shape[0], *value.shape[1:]), fill)
++                for i in range(batch_size):
++                    new_start = cu_seqlens_padded[i]
++                    old_start, old_end = cu_seqlens[i], cu_seqlens[i + 1]
++                    new_value[new_start : new_start + (old_end - old_start)] = value[
++                        old_start:old_end
++                    ]
++                sequence_padded_data[key] = new_value
+             elif key == "position_ids":
+@@ -1068,2 +1112,6 @@ def pad_packed_tensor_dict(
+             padded_data[key] = new_max_seqlen
++        elif key in ("sampler_head_ids", "sampler_head_logprobs"):
++            fill = float("-inf") if key == "sampler_head_logprobs" else 0
++            pad = value.new_full((pad_length, *value.shape[1:]), fill)
++            padded_data[key] = torch.cat([value, pad], dim=0)
+         elif key == "position_ids":
+diff --git a/areal/utils/score_centering.py b/areal/utils/score_centering.py
+new file mode 100644
+index 0000000..acc1cb3
+--- /dev/null
++++ b/areal/utils/score_centering.py
+@@ -0,0 +1,308 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Head/tail score centering with ordinary PyTorch autograd.
++
++The detached head/tail model follows Score Centering (arXiv:2609.20807)
++and the verl/slime references. The surrogate uses REINFORCE with optional truncated importance sampling.
++Full logits remain live; log-probabilities are computed in checkpointed chunks.
++"""
++
++import math
++
++import torch
++import torch.distributed as dist
++from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
++
++
++def validate_sampling(config) -> None:
++    """Reject sampling transformations not represented by the collected heads."""
++    if (
++        not isinstance(config.score_centering_top_k, int)
++        or isinstance(config.score_centering_top_k, bool)
++        or not 1 <= config.score_centering_top_k <= 1024
++    ):
++        raise ValueError("Score-centering head width must be an integer in [1, 1024].")
++    if (
++        config.temperature != 1.0
++        or config.greedy
++        or config.top_p != 1.0
++        or config.top_k not in (-1, int(1e8))
++        or config.frequency_penalty != 0
++        or config.use_beam_search
++    ):
++        raise ValueError(
++            "Score centering requires temperature=1, untruncated stochastic sampling, and no penalties."
++        )
++
++
++def validate_heads(ids, logprobs, count: int, width: int) -> None:
++    """Validate CPU transport metadata before it reaches the training hot path."""
++    if ids is None or logprobs is None or len(ids) != count or len(logprobs) != count:
++        raise ValueError("Missing or misaligned SGLang sampler heads.")
++    for row_ids, row_logprobs in zip(ids, logprobs):
++        if len(row_ids) != width or len(row_logprobs) != width:
++            raise ValueError("Sampler head width differs from the requested width.")
++        if (
++            any(not isinstance(i, int) or isinstance(i, bool) or i < 0 for i in row_ids)
++            or len(set(row_ids)) != width
++        ):
++            raise ValueError("Sampler head IDs must be distinct nonnegative integers.")
++        if any(
++            not isinstance(x, (float, int))
++            or isinstance(x, bool)
++            or not math.isfinite(x)
++            or x > 0
++            for x in row_logprobs
++        ):
++            raise ValueError("Sampler head logprobs must be finite and nonpositive.")
++        if sum(math.exp(x) for x in row_logprobs) > 1 + 1e-5:
++            raise ValueError("Sampler head probability mass exceeds one.")
++
++
++def parse_sampler_heads(meta: dict, output_tokens: list[int]):
++    """Read SGLang's standard [logprob, token_id, text] top-logprob rows."""
++    rows = meta.get("output_top_logprobs")
++    if not rows:
++        return None, None
++    try:
++        ids = [[entry[1] for entry in row] for row in rows]
++        logprobs = [[entry[0] for entry in row] for row in rows]
++        validate_heads(ids, logprobs, len(output_tokens), len(ids[0]))
++    except (IndexError, TypeError) as exc:
++        raise ValueError("Malformed SGLang sampler heads.") from exc
++    sampled = meta["output_token_logprobs"]
++    for row_ids, row_logprobs, sample in zip(ids, logprobs, sampled):
++        if sample[1] in row_ids:
++            head_logp = row_logprobs[row_ids.index(sample[1])]
++            if not math.isclose(head_logp, sample[0], rel_tol=1e-5, abs_tol=1e-5):
++                raise ValueError(
++                    "Sampled-token and head logprobs describe different distributions."
++                )
++    return ids, logprobs
++
++
++def trajectory_heads(response, width: int) -> dict[str, torch.Tensor]:
++    """Pad prompt positions; keep sampler heads aligned to generated tokens."""
++    validate_heads(
++        response.sampler_head_ids,
++        response.sampler_head_logprobs,
++        response.output_len,
++        width,
++    )
++    length = response.input_len + response.output_len
++    ids = torch.zeros((length, width), dtype=torch.int64)
++    logprobs = torch.full((length, width), -torch.inf, dtype=torch.float32)
++    if response.output_len:
++        ids[response.input_len :] = torch.tensor(
++            response.sampler_head_ids, dtype=torch.int64
++        )
++        logprobs[response.input_len :] = torch.tensor(
++            response.sampler_head_logprobs, dtype=torch.float32
++        )
++    return {"sampler_head_ids": ids, "sampler_head_logprobs": logprobs}
++
++
++def selected_logprobs(
++    logits: torch.Tensor,
++    ids: torch.Tensor,
++    chunk_size: int = 256,
++    compute_entropy: bool = True,
++):
++    """Selected log-probabilities using ordinary PyTorch autograd.
++
++    Checkpoint row chunks to avoid saving full FP32 log-probabilities for
++    backward. Full input logits remain live. Entropy is diagnostic-only.
++    """
++    if logits.ndim != 2 or ids.ndim != 2 or logits.shape[0] != ids.shape[0]:
++        raise ValueError("Expected logits [N,V] and token IDs [N,K].")
++    if chunk_size <= 0:
++        raise ValueError("chunk_size must be positive.")
++    dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
++
++    def compute(chunk, indices):
++        logp = chunk.to(dtype).log_softmax(-1)
++        selected = logp.gather(-1, indices.long())
++        entropy = -(logp.exp() * logp).sum(-1).detach() if compute_entropy else None
++        return selected, entropy
++
++    if logits.shape[0] == 0:
++        return compute(logits, ids)
++    outputs = [
++        checkpoint(
++            compute,
++            logits[start : start + chunk_size],
++            ids[start : start + chunk_size],
++            use_reentrant=False,
++        )
++        if torch.is_grad_enabled()
++        else compute(
++            logits[start : start + chunk_size], ids[start : start + chunk_size]
++        )
++        for start in range(0, logits.shape[0], chunk_size)
++    ]
++    selected = torch.cat([output[0] for output in outputs])
++    entropy = torch.cat([output[1] for output in outputs]) if compute_entropy else None
++    return selected, entropy
++
++
++def vocab_parallel_selected_logprobs(
++    logits: torch.Tensor,
++    ids: torch.Tensor,
++    *,
++    tp_group: dist.ProcessGroup | None,
++    vocab_size: int,
++    chunk_size: int = 256,
++):
++    """Selected probabilities from contiguous, equally sized vocabulary shards.
++
++    Token rows and IDs must be replicated within the explicit TP group. Each rank
++    evaluates the same loss, so SUM collectives have an identity local backward
++    (an autograd SUM backward would incorrectly multiply gradients by TP size).
++    Padding beyond the model vocabulary is excluded, matching the sampler.
++    No full-vocabulary gather or custom autograd kernel is needed.
++    """
++    if logits.ndim != 2 or ids.ndim != 2 or logits.shape[0] != ids.shape[0]:
++        raise ValueError("Expected logits [N,V_local] and token IDs [N,K].")
++    world_size = dist.get_world_size(tp_group) if tp_group is not None else 1
++    rank = dist.get_rank(tp_group) if tp_group is not None else 0
++    width = logits.shape[1]
++    if chunk_size <= 0 or not 0 < vocab_size <= width * world_size:
++        raise ValueError("Invalid chunk size or vocabulary size.")
++    torch._assert_async(
++        ((ids >= 0) & (ids < vocab_size)).all(),
++        "Selected token IDs must be within the model vocabulary.",
++    )
++    start = rank * width
++    valid_vocab = torch.arange(width, device=logits.device) + start < vocab_size
++    dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
++
++    def reduce_sum(value):
++        if world_size == 1:
++            return value
++        total = value.detach().clone()
++        dist.all_reduce(total, group=tp_group)
++        return total + (value - value.detach())
++
++    def compute(chunk, indices):
++        x = chunk.to(dtype).masked_fill(~valid_vocab, -torch.inf)
++        maximum = x.detach().amax(-1, keepdim=True)
++        if world_size > 1:
++            dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=tp_group)
++        shifted = x - maximum
++        denominator = reduce_sum(shifted.exp().sum(-1, keepdim=True))
++        local_ids = indices.long() - start
++        owned = (local_ids >= 0) & (local_ids < width) & (indices < vocab_size)
++        selected = shifted.gather(-1, local_ids.clamp(0, width - 1))
++        selected = reduce_sum(selected.masked_fill(~owned, 0))
++        logp = selected - denominator.log()
++        with torch.no_grad():
++            local_logp = shifted - denominator.log()
++            terms = local_logp.exp() * local_logp.masked_fill(~valid_vocab, 0)
++            entropy = -terms.sum(-1)
++            if world_size > 1:
++                dist.all_reduce(entropy, group=tp_group)
++        return logp, entropy
++
++    if logits.shape[0] == 0:
++        return logits.to(dtype).sum(-1, keepdim=True).expand_as(ids), logits.to(
++            dtype
++        ).sum(-1).detach()
++    # All TP ranks must replay every collective in identical order in backward.
++    with set_checkpoint_early_stop(False):
++        outputs = [
++            checkpoint(
++                compute,
++                logits[i : i + chunk_size],
++                ids[i : i + chunk_size],
++                use_reentrant=False,
++            )
++            if torch.is_grad_enabled()
++            else compute(logits[i : i + chunk_size], ids[i : i + chunk_size])
++            for i in range(0, logits.shape[0], chunk_size)
++        ]
++    return tuple(torch.cat([output[j] for output in outputs]) for j in range(2))
++
++
++def score_centering_correction(
++    train_head_logp, sampler_head_logp, eps=1e-6, *, tis_cap=None
++):
++    """Only the final score factor is differentiated; coefficients are detached."""
++    with torch.no_grad():
++        p, q = train_head_logp.exp(), sampler_head_logp.exp()
++        # Match the paper: only the denominator needs an epsilon floor.
++        # A sampler with zero tail mass must not acquire artificial tail mass.
++        rho = (1 - q.sum(-1)).clamp_min(0) / (1 - p.sum(-1)).clamp_min(eps)
++        if tis_cap is None:
++            residual = q - rho.unsqueeze(-1) * p
++        else:
++            # Paper Eq. 12: center the weighted scores. These algebraic forms
++            # avoid dividing by zero q or multiplying zero tail mass by infinity.
++            weighted_head_mass = torch.minimum(p, tis_cap * q)
++            alpha = (tis_cap * rho).clamp_max(1)
++            residual = weighted_head_mass - alpha.unsqueeze(-1) * p
++    return (residual * train_head_logp).sum(-1)
++
++
++def score_centering_logprobs(
++    logits,
++    labels,
++    head_ids,
++    sampler_head_logp,
++    chunk_size=256,
++    *,
++    tp_group=None,
++    vocab_size=None,
++    tis_cap=None,
++):
++    """Compute sampled log-probabilities, diagnostic entropy, and SC correction."""
++    if head_ids.shape != sampler_head_logp.shape:
++        raise ValueError("Sampler IDs and logprobs must have matching shapes.")
++    ids = torch.cat((labels.reshape(-1, 1), head_ids), dim=-1)
++    if vocab_size is None:
++        if tp_group is not None:
++            raise ValueError("Vocabulary-parallel score centering requires vocab_size.")
++        selected, entropy = selected_logprobs(logits, ids, chunk_size)
++    else:
++        selected, entropy = vocab_parallel_selected_logprobs(
++            logits, ids, tp_group=tp_group, vocab_size=vocab_size, chunk_size=chunk_size
++        )
++    correction = score_centering_correction(
++        selected[:, 1:], sampler_head_logp, tis_cap=tis_cap
++    )
++    return selected[:, 0], entropy, correction
++
++
++def score_centering_tis_weights(train_logp, sampler_logp, cap):
++    """Detached token-wise min(p/q, cap), using actual sampled-token logprobs."""
++    with torch.no_grad():
++        # Clamp in log space before exponentiating, including extreme mismatch.
++        return (train_logp - sampler_logp).clamp_max(math.log(cap)).exp().clamp_max(cap)
++
++
++def resolve_score_centering_tis_cap(rejection_sampling):
++    """Use AReaL's existing TIS configuration for the weighted SC objective.
++
++    SC uses current-trainer / sampler ratios, not decoupled PPO's proximal
++    ratios. Other rejection rules need their own weighted-centering derivation.
++    """
++    if rejection_sampling is None:
++        return None
++    rs = rejection_sampling
++    if (
++        rs.level != "token"
++        or rs.metric != "ratio"
++        or rs.action != "clamp"
++        or rs.lower not in (None, 0.0)
++    ):
++        raise ValueError(
++            "Score centering supports rejection_sampling only with "
++            "level='token', metric='ratio', action='clamp', and no lower bound."
++        )
++    if (
++        isinstance(rs.upper, bool)
++        or not math.isfinite(rs.upper)
++        or not 1 < rs.upper <= torch.finfo(torch.float32).max
++    ):
++        raise ValueError(
++            "Score-centering TIS upper must be finite, greater than 1, and FP32-representable."
++        )
++    return rs.upper
+diff --git a/areal/utils/topk_padding.py b/areal/utils/topk_padding.py
+new file mode 100644
+index 0000000..229b39c
+--- /dev/null
++++ b/areal/utils/topk_padding.py
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Padding helpers shared by the two sampler top-k transport paths.
++
++An absent top-k slot carries no probability mass, and ``exp(-inf) == 0`` is what
++expresses that: padding the log-probs with ``0.0`` would mean ``exp(0) == 1`` and
++silently inflate the sampler head mass.  Token ids are padded with 0; the trainer
++still gathers a log-probability for that id, so an absent slot only stays inert
++because its row is masked out of the loss downstream.
++"""
++
++NEG_INF_PAD = float("-inf")
++
++
++def pad_topk_ids(token_ids: list[int], k: int) -> list[int]:
++    """Right-pad a top-k token-id row to length *k* with the padding id 0."""
++    ids = list(token_ids[:k])
++    return ids + [0] * max(0, k - len(ids))
++
++
++def pad_topk_logps(logps: list[float], k: int) -> list[float]:
++    """Right-pad a top-k log-prob row to length *k* with ``-inf`` (q = 0)."""
++    ps = list(logps[:k])
++    return ps + [NEG_INF_PAD] * max(0, k - len(ps))
+diff --git a/areal/workflow/rlvr.py b/areal/workflow/rlvr.py
+index 8b77fb9..fbaa457 100644
+--- a/areal/workflow/rlvr.py
++++ b/areal/workflow/rlvr.py
+@@ -25,2 +25,3 @@ from areal.utils.perf_tracer import (
+ )
++from areal.utils.topk_padding import pad_topk_ids, pad_topk_logps
+ from areal.workflow.reward_metrics import log_reward_metrics
+@@ -180,2 +181,65 @@ class RLVRWorkflow(RolloutWorkflow):
+         }
+-        return {k: v.unsqueeze(0) for k, v in res.items()}
++
++        # Score Centering: propagate sampler top-k data if available
++        if resp.sampler_head_ids is not None and resp.sampler_head_logprobs is not None:
++            raw_max_k = (
++                max(len(k) for k in resp.sampler_head_ids)
++                if resp.sampler_head_ids
++                else 0
++            )
++            if raw_max_k > 0:
++                # Ragged rows are padded with id 0 / -inf.  The trainer still has a
++                # real probability at id 0, so those slots add a small bias to the
++                # correction (measured 2.2e-2 at 4 padded slots).  Warn rather than
++                # reject: agent transports legitimately return ragged blocks, and the
++                # bias is bounded by the padded fraction.
++                raw_min_k = min(len(k) for k in resp.sampler_head_ids)
++                if raw_min_k != raw_max_k:
++                    logger.warning(
++                        "Sampler top-k rows are ragged (%d..%d); padded slots bias "
++                        "the score-centering correction.",
++                        raw_min_k,
++                        raw_max_k,
++                    )
++                # vLLM returns 1 + num_logprobs entries (sampled token plus top-N),
++                # so raw_max_k may be score_centering_top_k + 1.  Cap k_dim at score_centering_top_k and let
++                # pad_topk_* truncate the extra entry, keeping every episode at one k.
++                score_centering_top_k = getattr(
++                    self.gconfig, "score_centering_top_k", 0
++                )
++                k_dim = (
++                    score_centering_top_k if score_centering_top_k > 0 else raw_max_k
++                )
++                # Raise if the sampler returned fewer top-k entries
++                # than score_centering_top_k requires — the SC correction needs a
++                # complete top-k head to estimate the tail mass ratio.
++                if score_centering_top_k > 0 and raw_max_k < score_centering_top_k:
++                    raise RuntimeError(
++                        f"Score Centering requires score_centering_top_k={score_centering_top_k} "
++                        f"but the sampler returned only {raw_max_k} "
++                        "top-k entries. Increase vLLM max_logprobs or "
++                        "reduce score_centering_top_k."
++                    )
++                # Pad absent slots with id 0 and log-prob -inf (zero mass).
++                input_topk_ids = [
++                    pad_topk_ids([], k_dim) for _ in range(resp.input_len)
++                ]
++                input_topk_logps = [
++                    pad_topk_logps([], k_dim) for _ in range(resp.input_len)
++                ]
++                sampler_head_ids = [
++                    pad_topk_ids(ids, k_dim) for ids in resp.sampler_head_ids
++                ]
++                sampler_head_logprobs = [
++                    pad_topk_logps(logps, k_dim) for logps in resp.sampler_head_logprobs
++                ]
++                res["sampler_head_ids"] = torch.tensor(
++                    input_topk_ids + sampler_head_ids, dtype=torch.int32
++                )  # [seq_len, k]
++                res["sampler_head_logprobs"] = torch.tensor(
++                    input_topk_logps + sampler_head_logprobs, dtype=torch.float32
++                )  # [seq_len, k]
++
++        result = {k: v.unsqueeze(0) for k, v in res.items()}
++
++        return result
