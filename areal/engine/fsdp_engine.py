@@ -400,6 +400,16 @@ class FSDPEngine(TrainEngine):
             raise ValueError(
                 "Tree training currently cannot be enabled with sp_size > 1."
             )
+        # SC rides vLLM: no sharded heads, reject before the forward pass.
+        if getattr(self.config, "use_score_centering", False) and (
+            self.parallel_helper.sp_size > 1
+            or self.parallel_helper.tp_size > 1
+            or self.enable_tree_training
+        ):
+            raise ValueError(
+                "Score centering requires sp_size == 1, tp_size == 1 and ordinary "
+                "sequences on the vLLM transport."
+            )
         # Monkey patch: replace attention's forward() with Ulysses variant.
         apply_monkey_patch(
             model=self.model,
@@ -2030,6 +2040,9 @@ class FSDPEngine(TrainEngine):
 
         inputs.pop("unit_weights", None)
         inputs.pop("is_truncated", None)
+        # Sampler heads feed the score-centering loss, not the model forward.
+        for head_key in ("sampler_head_ids", "sampler_head_logprobs"):
+            inputs.pop(head_key, None)
         ctx = FSDPTrainContext(
             model_inputs=inputs,
             mb_input=mb_item.orig_mb,
@@ -2185,12 +2198,69 @@ class FSDPEngine(TrainEngine):
                     entropy = entropy[: -ctx.pad_length]
                     vocab_min_logits = vocab_min_logits[: -ctx.pad_length]
                     vocab_max_logits = vocab_max_logits[: -ctx.pad_length]
+            # grpo_loss_fn takes sc_correction as a keyword-only argument.
+            sc_kwargs: dict[str, torch.Tensor] = {}
+            if getattr(self.config, "use_score_centering", False):
+                from areal.utils.score_centering import (
+                    resolve_score_centering_tis_cap,
+                    score_centering_logprobs,
+                )
+
+                ids = ctx.mb_input.get("sampler_head_ids")
+                q = ctx.mb_input.get("sampler_head_logprobs")
+                if q is not None:
+                    pad_slots = int((q <= -1e30).sum())
+                    zero_rows = int((q.exp().sum(-1) <= 0).sum())
+                    if pad_slots or zero_rows:
+                        self.logger.warning(
+                            "score centering: %d padded head slots and %d rows "
+                            "with zero sampler mass in this micro-batch",
+                            pad_slots,
+                            zero_rows,
+                        )
+                if ids is None or q is None:
+                    missing = (
+                        "sampler_head_ids" if ids is None else "sampler_head_logprobs"
+                    )
+                    raise ValueError(
+                        "use_score_centering=True but this micro-batch carries no "
+                        f"sampler top-k heads (missing {missing}); "
+                        f"mb_input keys={list(ctx.mb_input.keys())[:18]}. Check that "
+                        "the workflow propagates sampler_head_ids / "
+                        "sampler_head_logprobs for every generated token."
+                    )
+                n_tokens = ctx.mb_input["input_ids"].numel()
+                if logits.shape[0] < n_tokens:
+                    raise ValueError(
+                        "Score centering needs at least "
+                        f"{n_tokens} logit rows, got {logits.shape[0]}."
+                    )
+                if ids.ndim != 2 or ids.shape[0] != n_tokens or ids.shape != q.shape:
+                    raise ValueError(
+                        "Packed sampler heads must have shape [real_tokens, K]."
+                    )
+                labels = torch.roll(
+                    ctx.mb_input["input_ids"], shifts=-1, dims=-1
+                ).reshape(-1)
+                logprobs, entropy, sc_kwargs["sc_correction"] = (
+                    score_centering_logprobs(
+                        logits[:n_tokens],
+                        labels,
+                        ids,
+                        q,
+                        chunk_size=self.config.logprobs_chunk_size,
+                        tis_cap=resolve_score_centering_tis_cap(
+                            getattr(self.config, "rejection_sampling", None)
+                        ),
+                    )
+                )
             loss = loss_fn(
                 logprobs,
                 entropy,
                 ctx.mb_input,
                 vocab_min_logits=vocab_min_logits,
                 vocab_max_logits=vocab_max_logits,
+                **sc_kwargs,
             )
         else:
             values = self._compute_values(logits.squeeze(-1), ctx.ulysses_pad_size)

@@ -44,6 +44,10 @@ from areal.utils.functional import (
 )
 from areal.utils.functional.loss_aggregation import PolicyGradientReduction
 from areal.utils.perf_tracer import trace_perf
+from areal.utils.score_centering import (
+    resolve_score_centering_tis_cap,
+    score_centering_tis_weights,
+)
 from areal.utils.stats_tracker import ReduceType
 
 logger = logging.getLogger("PPOActor")
@@ -256,6 +260,7 @@ class PPOActor:
             data["behavior_logp"] = behavior_logp
             old_logp = data["logprobs"] = prox_logp_value
         else:
+            # recompute_logprob=False: old_logp is the sampler log-prob, shifted by -1 already.
             old_logp = behavior_logp
             if not self.config.use_decoupled_loss:
                 # prox logp not available, use inferenced logp
@@ -333,6 +338,14 @@ class PPOActor:
         data["loss_mask"] = loss_mask
         # because we have rolled old_logp by -1
         data["logprobs"] = old_logp
+
+        # Shift sampler top-k left by one: topk[t] generated x_t, logits[t] predicts x_{t+1}.
+        for key in (
+            "sampler_head_logprobs",
+            "sampler_head_ids",
+        ):
+            if key in data and data[key] is not None:
+                data[key] = torch.roll(data[key], shifts=-1, dims=1)
 
         return data
 
@@ -493,6 +506,9 @@ class PPOActor:
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_decoupled_loss=self.config.use_decoupled_loss,
                         pg_reduction=loss_step,
+                        use_score_centering=self.config.use_score_centering,
+                        sc_reinforce_baseline=self.config.sc_reinforce_baseline,
+                        sc_loss_mode=self.config.sc_loss_mode,
                     ),
                     loss_weight_fn=loss_step.normalizer_fn,
                 )
@@ -649,6 +665,10 @@ def grpo_loss_fn(
     vocab_max_logits: torch.Tensor | None = None,
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
+    use_score_centering: bool = False,
+    sc_correction: torch.Tensor | None = None,
+    sc_reinforce_baseline: bool = False,
+    sc_loss_mode: str = "reinforce",
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -736,8 +756,98 @@ def grpo_loss_fn(
             unit_weights=input_data.get("unit_weights"),
         )
 
+    # SC: Plan A = REINFORCE + SC (default), Plan B = PPO surrogate + SC additive.
+    sc_loss = None
+    # True when Plan A replaced the PPO surrogate: the PPO statistics below are
+    # then observational only.  loss_mode is the numeric tag the tracker records.
+    sc_loss_overridden = False
+    loss_mode = "ppo"
+    if use_score_centering:
+        if sc_correction is not None:
+            tis_cap = resolve_score_centering_tis_cap(rejection_sampling)
+            if tis_cap is None:
+                sc_weight = torch.ones_like(logprobs)
+            else:
+                # Sampled term uses min(p/q, cap); the correction carries its own weights.
+                behavior_logp = torch.where(
+                    loss_mask.bool(), old_logp, logprobs.detach()
+                )
+                sc_weight = score_centering_tis_weights(
+                    logprobs, behavior_logp, tis_cap
+                )
+
+            sc_term = advantages.detach() * sc_correction
+            if sc_loss_mode == "reinforce":
+                # Plan A: REINFORCE + SC
+                pg_term = (
+                    -advantages.detach() * sc_weight * logprobs
+                )  # -A · w · log p(a); w = 1 without TIS
+                combined = torch.where(
+                    loss_mask,
+                    pg_term + sc_term,
+                    torch.zeros_like(pg_term),
+                )
+                loss = pg_reduction.aggregate(
+                    combined,
+                    loss_mask,
+                    denominator_mask=denominator_mask,
+                    cu_seqlens=input_data.get("cu_seqlens"),
+                    unit_weights=input_data.get("unit_weights"),
+                )
+                sc_loss_overridden = True
+                loss_mode = "reinforce_sc"
+            else:
+                # Plan B: add the SC correction to the PPO clipped surrogate.
+                sc_combined = torch.where(
+                    loss_mask,
+                    sc_term,
+                    torch.zeros_like(sc_term),
+                )
+                sc_additive = pg_reduction.aggregate(
+                    sc_combined,
+                    loss_mask,
+                    denominator_mask=denominator_mask,
+                    cu_seqlens=input_data.get("cu_seqlens"),
+                    unit_weights=input_data.get("unit_weights"),
+                )
+                loss = loss + sc_additive
+                sc_loss_overridden = False  # PPO stats are still meaningful
+                loss_mode = "ppo_sc"
+            sc_loss = sc_term.detach()  # for logging
+        else:
+            raise ValueError(
+                "use_score_centering=True but the engine supplied no sc_correction; "
+                f"input_data keys={list(input_data.keys())[:18]}. "
+                "This usually means the sampler returned no top-k log-probs. "
+                "Check that score_centering_top_k is set and that vLLM is allowed "
+                "to return that many log-probs, or disable use_score_centering."
+            )
+    elif sc_reinforce_baseline:
+        # A1 baseline: pure REINFORCE (-A·log p(a)), no PPO ratio, no clipping.
+        # Used for fair SC-on vs SC-off comparison under Plan A.
+        pg_term = -advantages.detach() * logprobs  # -A·log p(a), grad through logprobs
+        combined = torch.where(
+            loss_mask,
+            pg_term,
+            torch.zeros_like(pg_term),
+        )
+        loss = pg_reduction.aggregate(
+            combined,
+            loss_mask,
+            denominator_mask=denominator_mask,
+            cu_seqlens=input_data.get("cu_seqlens"),
+            unit_weights=input_data.get("unit_weights"),
+        )
+        sc_loss_overridden = True
+        loss_mode = "reinforce_baseline"
+
     # Joint Distillation KL Loss
     teacher_logp = input_data.get("teacher_logp")
+    if (use_score_centering or sc_reinforce_baseline) and teacher_logp is not None:
+        raise ValueError(
+            "Score centering with distillation is not supported: the "
+            "distillation branch would replace the REINFORCE+SC objective."
+        )
     rkl_stat = None
     if teacher_logp is not None:
         if pg_reduction.mode != "token-mean":
@@ -847,11 +957,25 @@ def grpo_loss_fn(
         new_logp=logprobs.detach(),
         old_logp=old_logp,
         entropy=entropy.float(),
-        actor_loss=stat["loss"],
+        actor_loss=stat["loss"] if not sc_loss_overridden else combined.detach(),
         clip_ratio=stat["clip_mask"].float(),
         dual_clip_ratio=stat["dual_clip_mask"].float(),
         denominator="n_valid_tokens",
     )
+    # The scalar tracker accepts numbers only. Dashboard loss-mode codes:
+    # 0 = PPO, 1 = REINFORCE + SC, 2 = REINFORCE baseline, 3 = PPO + SC.
+    loss_mode_codes = {
+        "ppo": 0,
+        "reinforce_sc": 1,
+        "reinforce_baseline": 2,
+        "ppo_sc": 3,
+    }
+    if use_score_centering or sc_reinforce_baseline:
+        # Only scored runs need these; plain PPO users would otherwise see two
+        # permanently zero series.
+        stats_tracker.scalar(loss_mode=loss_mode_codes[loss_mode])
+        # 1 when the correction was applied this step, 0 when SC was skipped.
+        stats_tracker.scalar(sc_active=1 if sc_correction is not None else 0)
     if "behave_imp_weight" in stat:
         stats_tracker.denominator(unclipped_behave_tokens=stat["behave_mask"])
         stats_tracker.stat(
@@ -901,6 +1025,19 @@ def grpo_loss_fn(
         current_version=current_version,
         compute_logp_mask=compute_logp_mask,
     )
+
+    # Score centering reports the correction itself; the head/tail diagnostics
+    # (s_bar, q_mass, p_mass, rho) are internal to the engine-side computation.
+    if sc_correction is not None:
+        stats_tracker.stat(
+            sc_correction=sc_correction.detach(),
+            denominator="n_valid_tokens",
+        )
+        if sc_loss is not None:
+            stats_tracker.stat(
+                sc_loss_term=sc_loss,
+                denominator="n_valid_tokens",
+            )
 
     return loss
 
