@@ -326,8 +326,16 @@ class ArenaOpenAPIClient:
     ) -> dict[str, Any]:
         """Fetch the terminal Harness receipt for one failed task."""
 
+        try:
+            return await self._get_failure_artifact_async(
+                task_id, "harness_result.json", client=client, timeout=timeout
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
+        # Some native Harnesses register the same receipt under this name.
         return await self._get_failure_artifact_async(
-            task_id, "harness_result.json", client=client, timeout=timeout
+            task_id, "native-receipt.json", client=client, timeout=timeout
         )
 
     async def get_whitebox_lifecycle_async(
@@ -341,7 +349,9 @@ class ArenaOpenAPIClient:
     async def _get_failure_artifact_async(
         self,
         task_id: str,
-        artifact: Literal["harness_result.json", "whitebox-lifecycle.json"],
+        artifact: Literal[
+            "harness_result.json", "native-receipt.json", "whitebox-lifecycle.json"
+        ],
         *,
         client: httpx.AsyncClient,
         timeout: float,
@@ -950,13 +960,15 @@ class ArenaOpenAPIClient:
         client: httpx.AsyncClient,
         method: str,
         url: str,
+        _retry_count: int | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
-        for attempt in range(self.request_retries + 1):
+        retries = self.request_retries if _retry_count is None else _retry_count
+        for attempt in range(retries + 1):
             try:
                 response = await client.request(method, url, **kwargs)
             except httpx.RequestError as exc:
-                if attempt == self.request_retries:
+                if attempt == retries:
                     raise ArenaAPIError(
                         f"Arena OpenAPI request failed after {attempt + 1} attempts: "
                         f"{type(exc).__name__}"
@@ -965,7 +977,7 @@ class ArenaOpenAPIClient:
                 continue
             if not _is_retryable_response(response):
                 return response
-            if attempt == self.request_retries:
+            if attempt == retries:
                 return response
             await response.aclose()
             await asyncio.sleep(min(2**attempt, 10))
@@ -1114,9 +1126,20 @@ class ArenaOpenAPIClient:
             )
         if status and status not in {"DONE", "OK"}:
             if has_task_id:
-                if on_launch_success is not None:
-                    on_launch_success(task_id)
-                return await self._poll_task_result(client, task_id)
+                try:
+                    if on_launch_success is not None:
+                        on_launch_success(task_id)
+                    return await self._poll_task_result(client, task_id)
+                except ArenaTaskFailedError:
+                    # The server has already finished this task. Preserve its
+                    # failure receipt rather than cancelling a terminal job.
+                    raise
+                except (Exception, asyncio.CancelledError):
+                    # Worker destruction cancels pending workflows before Ray
+                    # stops the RPC processes. Finish remote cleanup while the
+                    # workflow's HTTP client and proxy route are still alive.
+                    await self._cancel_launched_job(client, payload, task_id)
+                    raise
             raise ArenaAPIError(
                 f"launch_one_task response has status {status} but no task_id to poll"
             )
@@ -1128,6 +1151,77 @@ class ArenaOpenAPIClient:
         if on_launch_success is not None:
             on_launch_success(task_id if has_task_id else None)
         return result
+
+    async def _cancel_launched_job(
+        self,
+        client: httpx.AsyncClient,
+        launch_payload: Any,
+        task_id: str,
+    ) -> None:
+        """Best-effort, bounded cleanup of this launch's single-task job.
+
+        Never scan an experiment or cancel by shared model name: other workflows
+        can still be using that model. A lost launch response or a force-killed
+        worker cannot be recovered by this in-process cleanup.
+        """
+        from areal.utils import logging
+
+        logger = logging.getLogger("ArenaStreamAgent")
+        job_id = None
+        try:
+            async with asyncio.timeout(min(self.timeout, 10.0)):
+                # These reads and cancellation of a known job are safe to retry
+                # independently of task creation. Short gateway outages should
+                # use the existing cleanup window, even when launch retries are
+                # disabled. The outer deadline still bounds requests/backoffs.
+                cleanup_retries = max(self.request_retries, 4)
+                if isinstance(launch_payload, Mapping):
+                    job_id = launch_payload.get("job_id")
+                if not isinstance(job_id, str) or not job_id:
+                    # Older launch envelopes only expose task_id. Resolve its
+                    # actual job without inferring IDs from naming conventions.
+                    encoded_task_id = quote(task_id, safe="")
+                    response = await self._async_request(
+                        client,
+                        "GET",
+                        f"{self.base_url}/openapi/v1/tasks/{encoded_task_id}",
+                        _retry_count=cleanup_retries,
+                        headers=self._headers,
+                    )
+                    task_payload = _response_json(response)
+                    if isinstance(task_payload, Mapping):
+                        task = task_payload.get("task", task_payload)
+                        if isinstance(task, Mapping) and task.get("task_id") == task_id:
+                            job_id = task.get("job_id")
+                if not isinstance(job_id, str) or not job_id:
+                    raise ArenaAPIError("Arena launch has no resolvable job_id")
+                encoded_job_id = quote(job_id, safe="")
+                response = await self._async_request(
+                    client,
+                    "POST",
+                    f"{self.base_url}/openapi/v1/jobs/{encoded_job_id}/cancel",
+                    _retry_count=cleanup_retries,
+                    headers=self._headers,
+                )
+                # A terminal job can race with cancellation. The cancel endpoint
+                # rejects terminal jobs with 409 and missing jobs with 404.
+                if response.status_code not in {404, 409}:
+                    response.raise_for_status()
+                logger.info(
+                    "Arena job cleanup finished: job_id=%s task_id=%s http_status=%s",
+                    job_id,
+                    task_id,
+                    response.status_code,
+                )
+        except (Exception, asyncio.CancelledError):
+            # Cleanup must not replace the original timeout, cancellation or
+            # transport error, nor prevent the remaining workers from exiting.
+            logger.warning(
+                "Arena job cleanup failed: job_id=%s task_id=%s",
+                job_id or "unknown",
+                task_id,
+                exc_info=True,
+            )
 
     async def _poll_task_result(
         self,
