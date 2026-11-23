@@ -1,0 +1,30 @@
+feat(engine): support score centering on Megatron actors
+
+Score centering (#1797) was limited to FSDP actors: PPOActorConfig rejected
+any non-FSDP backend and megatron_engine never scored the sampler's top-k
+heads, so Megatron runs could not apply the drift correction.
+
+Enable the actor side for Megatron:
+
+Key changes:
+- cli_args: replace the FSDP-only guard with a backend-aware validation that
+  accepts megatron:* (data/tensor/pipeline/expert parallel) and still rejects
+  the modes that break the one-row-per-token contract (tree, critic, MTP,
+  chunked logits).
+- megatron_engine: score the sampler heads before the fused loss reuses the
+  logits, reduce vocabulary shards over the TP group, reject shards that cannot
+  cover the vocabulary, and warn once when the sampler heads cover < 90% of the
+  probability mass.
+- packed_context_parallel: let the CP row split carry trailing dims so
+  [tokens, K] heads split like 1-D labels (unchanged at cp_size == 1).
+- tests: 30 CPU cases for the config matrix, CP row alignment, engine helper
+  branches and the SC math reference.
+
+Verified on 8 Ascend dies (3 steps per arm): dp4, dp2xtp2, pp2xtp2 and MoE
+ep4+tp4 all keep q_mass~1 and rho~1 with sc_active=1; TP vs DP q_mass differ by
+4e-5, inside the 1e-3 parity budget.
+
+cp>1 remains experimental: two layout bugs are fixed here, but the loss-side row
+layout is not aligned yet, so keep cp=1 in production configs.
+
+Refs: #1797
